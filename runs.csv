@@ -1,0 +1,10 @@
+run_id,melee_kills,magic_kills,melee_hits,magic_hits,damage_taken,damage_dealt,deaths,time_alive,weapon,spell,boots,armor,enemy_hp_mult,enemy_dmg_mult,enemy_speed_mult,spawn_count,heal_on_kill_base
+run_92792,0,0,0,0,102.0,0.0,1,2.784,Hatchet,Ice Needle,Leather Boots,Cloth Wrap,1.0,1.0,1.0,6,8
+run_92792,0,0,0,0,102.0,0.0,1,2.784,Hatchet,Ice Needle,Leather Boots,Cloth Wrap,1.0,1.0,1.0,6,8
+run_43153,0,0,0,0,102.0,0.0,1,33.176,Rapier,Ember Bolt,Voidstep Treads,Cloth Wrap,1.0,1.0,1.0,6,8
+run_43153,0,0,0,0,102.0,0.0,1,33.176,Rapier,Ember Bolt,Voidstep Treads,Cloth Wrap,1.0,1.0,1.0,6,8
+run_52193,0,0,3,0,105.0,42.0,1,8.337,Hatchet,Hex Spike,Sprint Greaves,Chain Shirt,1.0,1.0,1.0,6,8
+run_52193,0,0,3,0,105.0,42.0,1,8.337,Hatchet,Hex Spike,Sprint Greaves,Chain Shirt,1.0,1.0,1.0,6,8
+run_92088,0,0,0,2,104.0,16.0,1,17.396,Rapier,Ice Needle,Voidstep Treads,Blood Harness,1.0,1.0,1.0,6,8
+run_92088,0,0,0,2,104.0,16.0,1,17.396,Rapier,Ice Needle,Voidstep Treads,Blood Harness,1.0,1.0,1.0,6,8
+run_38714,0,0,0,0,104.0,0.0,1,2.367,Rusty Blade,Hex Spike,Leather Boots,Blood Harness,1.0,1.0,1.0,6,8

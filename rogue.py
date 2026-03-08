@@ -1,0 +1,657 @@
+import math
+import os
+import csv
+import random
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Optional, Dict
+
+import pygame
+
+
+W, H = 960, 540
+FPS = 60
+ARENA_MARGIN = 40
+
+PLAYER_SPEED = 220.0
+DASH_SPEED = 600.0
+DASH_TIME = 0.12
+DASH_CD = 1.25  
+
+MELEE_RANGE = 42
+MELEE_ARC_DEG = 90
+MELEE_CD_BASE = 0.45  
+PROJECTILE_SPEED = 420.0
+MAGIC_CD_BASE = 0.60  
+MAGIC_AMMO_MAX = 12
+
+DEFEND_SLOW = 0.55
+DEFEND_DMG_MULT = 0.55
+
+HEAL_ON_KILL_BASE = 8 
+
+ENEMY_BASE_HP = 42
+ENEMY_BASE_DMG = 9
+ENEMY_SPEED = 140.0
+ENEMY_AGGRO_R = 260.0
+
+FONT_NAME = None
+
+ENABLE_MODEL = False
+MODEL_DIR = "models"
+
+
+
+
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+def vec_len(x, y):
+    return math.hypot(x, y)
+
+def norm(x, y):
+    l = vec_len(x, y)
+    if l <= 1e-9:
+        return 0.0, 0.0
+    return x / l, y / l
+
+def angle_deg(x, y):
+    return math.degrees(math.atan2(y, x))
+
+def angle_diff_deg(a, b):
+    d = (a - b + 180) % 360 - 180
+    return d
+
+
+
+
+
+
+@dataclass
+class Weapon:
+    name: str
+    dmg: float
+    cd_mult: float 
+    heal_mult: float 
+
+@dataclass
+class Spell:
+    name: str
+    dmg: float
+    cd_mult: float
+    ammo_max: int
+
+@dataclass
+class Boots:
+    name: str
+    dash_dist_mult: float
+
+@dataclass
+class Armor:
+    name: str
+    dmg_absorb: float
+    heal_on_kill_bonus: int
+
+WEAPONS = [
+    Weapon("Rusty Blade", dmg=11, cd_mult=1.00, heal_mult=1.00),
+    Weapon("Hatchet", dmg=14, cd_mult=1.12, heal_mult=1.05),
+    Weapon("Rapier", dmg=9, cd_mult=0.80, heal_mult=0.95),
+]
+SPELLS = [
+    Spell("Ember Bolt", dmg=10, cd_mult=1.00, ammo_max=12),
+    Spell("Ice Needle", dmg=8, cd_mult=0.78, ammo_max=16),
+    Spell("Hex Spike", dmg=14, cd_mult=1.25, ammo_max=9),
+]
+BOOTS = [
+    Boots("Leather Boots", dash_dist_mult=1.00),
+    Boots("Sprint Greaves", dash_dist_mult=1.25),
+    Boots("Voidstep Treads", dash_dist_mult=1.45),
+]
+ARMORS = [
+    Armor("Cloth Wrap", dmg_absorb=0.5, heal_on_kill_bonus=0),
+    Armor("Chain Shirt", dmg_absorb=2.0, heal_on_kill_bonus=0),
+    Armor("Blood Harness", dmg_absorb=1.0, heal_on_kill_bonus=6),  # berserker
+]
+
+
+
+@dataclass
+class CombatMetrics:
+    melee_kills: int = 0
+    magic_kills: int = 0
+    melee_hits: int = 0
+    magic_hits: int = 0
+    damage_taken: float = 0.0
+    damage_dealt: float = 0.0
+    deaths: int = 0
+    time_alive: float = 0.0
+
+    def to_feature_vector(self) -> List[float]:
+        # melee_ratio, magic_ratio, hits_per_kill_melee, hits_per_kill_magic, dmg_taken/dmg_dealt, death_rate
+        total_kills = self.melee_kills + self.magic_kills
+        melee_ratio = (self.melee_kills / total_kills) if total_kills > 0 else 0.5
+        magic_ratio = (self.magic_kills / total_kills) if total_kills > 0 else 0.5
+        hpk_melee = (self.melee_hits / self.melee_kills) if self.melee_kills > 0 else float(self.melee_hits + 1)
+        hpk_magic = (self.magic_hits / self.magic_kills) if self.magic_kills > 0 else float(self.magic_hits + 1)
+        dmg_ratio = (self.damage_taken / self.damage_dealt) if self.damage_dealt > 1e-6 else 1.0
+        death_rate = (self.deaths / max(self.time_alive, 1e-6)) * 60.0  # deaths per minute
+        return [
+            clamp(melee_ratio, 0.0, 1.0),
+            clamp(magic_ratio, 0.0, 1.0),
+            clamp(hpk_melee, 0.0, 10.0),
+            clamp(hpk_magic, 0.0, 10.0),
+            clamp(dmg_ratio, 0.0, 5.0),
+            clamp(death_rate, 0.0, 5.0),
+        ]
+
+
+
+
+class Projectile:
+    def __init__(self, x, y, vx, vy, dmg):
+        self.x, self.y = x, y
+        self.vx, self.vy = vx, vy
+        self.dmg = dmg
+        self.r = 6
+        self.alive = True
+
+    def update(self, dt, walls_rect):
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        if not walls_rect.collidepoint(self.x, self.y):
+            self.alive = False
+
+    def draw(self, surf):
+        pygame.draw.circle(surf, (160, 220, 255), (int(self.x), int(self.y)), self.r)
+
+class Enemy:
+    def __init__(self, x, y, hp, dmg, speed, aggro_r):
+        self.x, self.y = x, y
+        self.hp = hp
+        self.max_hp = hp
+        self.dmg = dmg
+        self.speed = speed
+        self.aggro_r = aggro_r
+        self.r = 16
+        self.alive = True
+        self.atk_cd = 0.0
+
+    def take_damage(self, amount):
+        self.hp -= amount
+        if self.hp <= 0:
+            self.alive = False
+
+    def update(self, dt, player, arena_rect):
+        if not self.alive:
+            return
+        self.atk_cd = max(0.0, self.atk_cd - dt)
+        dx, dy = (player.x - self.x), (player.y - self.y)
+        dist = vec_len(dx, dy)
+
+        if dist <= self.aggro_r:
+            nx, ny = norm(dx, dy)
+            self.x += nx * self.speed * dt
+            self.y += ny * self.speed * dt
+
+        self.x = clamp(self.x, arena_rect.left + self.r, arena_rect.right - self.r)
+        self.y = clamp(self.y, arena_rect.top + self.r, arena_rect.bottom - self.r)
+
+        if dist <= (self.r + player.r + 6) and self.atk_cd <= 0.0:
+            self.atk_cd = 0.75
+            player.receive_damage(self.dmg)
+
+    def draw(self, surf):
+        if not self.alive:
+            return
+        pygame.draw.circle(surf, (240, 120, 120), (int(self.x), int(self.y)), self.r)
+        # hp bar
+        bar_w = 34
+        hp_ratio = max(0.0, self.hp / self.max_hp)
+        pygame.draw.rect(surf, (40, 40, 40), (int(self.x - bar_w/2), int(self.y - 28), bar_w, 6))
+        pygame.draw.rect(surf, (80, 220, 80), (int(self.x - bar_w/2), int(self.y - 28), int(bar_w * hp_ratio), 6))
+
+
+class Player:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+        self.r = 18
+
+        self.max_hp = 100
+        self.hp = 100
+
+        self.weapon = random.choice(WEAPONS)
+        self.spell = random.choice(SPELLS)
+        self.boots = random.choice(BOOTS)
+        self.armor = random.choice(ARMORS)
+
+        self.facing_deg = 0.0
+
+        self.melee_cd = 0.0
+        self.magic_cd = 0.0
+        self.magic_ammo = self.spell.ammo_max
+
+        self.defending = False
+
+        self.dashing = False
+        self.dash_t = 0.0
+        self.dash_cd = 0.0
+        self.dash_dir = (0.0, 0.0)
+
+        self.alive = True
+
+        self.metrics: CombatMetrics = CombatMetrics()
+
+    def set_loadout(self, weapon=None, spell=None, boots=None, armor=None):
+        if weapon: self.weapon = weapon
+        if spell:
+            self.spell = spell
+            self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
+        if boots: self.boots = boots
+        if armor: self.armor = armor
+
+    def heal_on_kill(self):
+        heal = int(HEAL_ON_KILL_BASE * self.weapon.heal_mult) + self.armor.heal_on_kill_bonus
+        self.hp = min(self.max_hp, self.hp + heal)
+
+    def receive_damage(self, raw_amount):
+        if not self.alive:
+            return
+        amount = max(0.0, raw_amount - self.armor.dmg_absorb)
+        if self.defending:
+            amount *= DEFEND_DMG_MULT
+        self.hp -= amount
+        self.metrics.damage_taken += amount
+        if self.hp <= 0:
+            self.alive = False
+            self.metrics.deaths += 1
+
+    def update(self, dt, keys, arena_rect):
+        if not self.alive:
+            return
+
+        self.metrics.time_alive += dt
+
+        self.melee_cd = max(0.0, self.melee_cd - dt)
+        self.magic_cd = max(0.0, self.magic_cd - dt)
+        self.dash_cd = max(0.0, self.dash_cd - dt)
+
+        self.defending = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+
+        mx = (1 if keys[pygame.K_d] else 0) - (1 if keys[pygame.K_a] else 0)
+        my = (1 if keys[pygame.K_s] else 0) - (1 if keys[pygame.K_w] else 0)
+        nx, ny = norm(mx, my)
+
+        if self.dashing:
+            self.dash_t += dt
+            self.x += self.dash_dir[0] * DASH_SPEED * dt
+            self.y += self.dash_dir[1] * DASH_SPEED * dt
+            if self.dash_t >= DASH_TIME:
+                self.dashing = False
+                self.dash_t = 0.0
+        else:
+            speed = PLAYER_SPEED
+            if self.defending:
+                speed *= DEFEND_SLOW
+            self.x += nx * speed * dt
+            self.y += ny * speed * dt
+
+        self.x = clamp(self.x, arena_rect.left + self.r, arena_rect.right - self.r)
+        self.y = clamp(self.y, arena_rect.top + self.r, arena_rect.bottom - self.r)
+
+
+
+    def try_dash(self):
+        if not self.alive:
+            return
+        if self.dash_cd > 0.0 or self.dashing:
+            return
+        rad = math.radians(self.facing_deg)
+        dx, dy = math.cos(rad), math.sin(rad)
+        self.dashing = True
+        self.dash_dir = (dx, dy)
+        self.dash_cd = DASH_CD
+
+    def try_melee(self, enemies: List[Enemy]):
+        if not self.alive or self.melee_cd > 0.0:
+            return
+        self.melee_cd = MELEE_CD_BASE * self.weapon.cd_mult
+        hit_any = False
+        for e in enemies:
+            if not e.alive:
+                continue
+            dx, dy = (e.x - self.x), (e.y - self.y)
+            dist = vec_len(dx, dy)
+            if dist > MELEE_RANGE + e.r:
+                continue
+            ang = angle_deg(dx, dy)
+            if abs(angle_diff_deg(ang, self.facing_deg)) <= (MELEE_ARC_DEG / 2):
+                e.take_damage(self.weapon.dmg)
+                self.metrics.melee_hits += 1
+                self.metrics.damage_dealt += self.weapon.dmg
+                hit_any = True
+        return hit_any
+
+    def try_magic(self, projectiles: List[Projectile]):
+        if not self.alive or self.magic_cd > 0.0 or self.magic_ammo <= 0:
+            return
+        self.magic_cd = MAGIC_CD_BASE * self.spell.cd_mult
+        self.magic_ammo -= 1
+        rad = math.radians(self.facing_deg)
+        vx = math.cos(rad) * PROJECTILE_SPEED
+        vy = math.sin(rad) * PROJECTILE_SPEED
+        px = self.x + math.cos(rad) * (self.r + 8)
+        py = self.y + math.sin(rad) * (self.r + 8)
+        projectiles.append(Projectile(px, py, vx, vy, self.spell.dmg))
+
+    def draw(self, surf):
+        col = (130, 210, 140) if self.alive else (80, 80, 80)
+        pygame.draw.circle(surf, col, (int(self.x), int(self.y)), self.r)
+        # facing line
+        rad = math.radians(self.facing_deg)
+        fx = self.x + math.cos(rad) * (self.r + 12)
+        fy = self.y + math.sin(rad) * (self.r + 12)
+        pygame.draw.line(surf, (20, 20, 20), (int(self.x), int(self.y)), (int(fx), int(fy)), 3)
+
+
+
+@dataclass
+class Node:
+    idx: int
+    kind: str  # "combat", "loot", "boss"
+    cleared: bool = False
+
+def generate_node_map(n=10) -> List[Node]:
+    nodes = []
+    for i in range(n):
+        if i == n - 1:
+            k = "boss"
+        else:
+            k = "loot" if random.random() < 0.25 else "combat"
+        nodes.append(Node(i, k, cleared=False))
+    return nodes
+
+
+def apply_model_tuning_if_available(player: Player):
+    if not ENABLE_MODEL:
+        return None
+
+    try:
+        import torch
+        from model_runtime import LoadedModels
+        global _LOADED
+        if "_LOADED" not in globals():
+            _LOADED = LoadedModels.load(MODEL_DIR)
+        features = torch.tensor([player.metrics.to_feature_vector()], dtype=torch.float32)
+        gen = _LOADED.generate(features)  
+        return gen
+    except Exception as e:
+        print("[MODEL] Failed to load/apply model:", e)
+        return None
+
+
+def roll_loot(player: Player):
+    total_k = player.metrics.melee_kills + player.metrics.magic_kills
+    melee_ratio = player.metrics.melee_kills / total_k if total_k > 0 else 0.5
+
+    choices = []
+    if melee_ratio >= 0.55:
+        choices.append(("weapon", random.choice(WEAPONS)))
+        choices.append(("armor", random.choice(ARMORS)))
+    else:
+        choices.append(("spell", random.choice(SPELLS)))
+        choices.append(("boots", random.choice(BOOTS)))
+    choices.append((random.choice(["weapon", "spell", "boots", "armor"]),
+                    random.choice(WEAPONS + SPELLS + BOOTS + ARMORS)))
+
+    kind, item = random.choice(choices)
+    if kind == "weapon":
+        player.set_loadout(weapon=item)
+    elif kind == "spell":
+        player.set_loadout(spell=item)
+        player.magic_ammo = player.spell.ammo_max
+    elif kind == "boots":
+        player.set_loadout(boots=item)
+    elif kind == "armor":
+        player.set_loadout(armor=item)
+
+LOG_FILE = "runs.csv"
+
+def ensure_log_header():
+    if not os.path.exists(LOG_FILE):
+        with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "run_id",
+                "melee_kills","magic_kills",
+                "melee_hits","magic_hits",
+                "damage_taken","damage_dealt",
+                "deaths","time_alive",
+                "weapon","spell","boots","armor",
+                "enemy_hp_mult","enemy_dmg_mult","enemy_speed_mult","spawn_count",
+                "heal_on_kill_base"
+            ])
+
+def append_run(run_id: str, player: Player, applied: Dict[str, float]):
+    ensure_log_header()
+    m = player.metrics
+    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            run_id,
+            m.melee_kills, m.magic_kills,
+            m.melee_hits, m.magic_hits,
+            round(m.damage_taken, 3), round(m.damage_dealt, 3),
+            m.deaths, round(m.time_alive, 3),
+            player.weapon.name, player.spell.name, player.boots.name, player.armor.name,
+            applied["enemy_hp_mult"], applied["enemy_dmg_mult"], applied["enemy_speed_mult"], applied["spawn_count"],
+            HEAL_ON_KILL_BASE
+        ])
+
+
+
+
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Roguelike DDA Prototype (Real-time)")
+    clock = pygame.time.Clock()
+    font = pygame.font.Font(FONT_NAME, 18)
+    big = pygame.font.Font(FONT_NAME, 28)
+
+    arena = pygame.Rect(ARENA_MARGIN, ARENA_MARGIN, W - 2*ARENA_MARGIN, H - 2*ARENA_MARGIN)
+
+    nodes = generate_node_map(10)
+    node_i = 0
+
+    applied = {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 6}
+
+    player = Player(W/2, H/2)
+
+    projectiles: List[Projectile] = []
+    enemies: List[Enemy] = []
+
+    def spawn_room(kind: str):
+        nonlocal enemies, projectiles, applied
+        projectiles = []
+        enemies = []
+
+        applied = {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 6}
+
+        gen = apply_model_tuning_if_available(player)
+        if gen:
+            applied["enemy_hp_mult"] = float(gen.get("enemy_hp_mult", 1.0))
+            applied["enemy_dmg_mult"] = float(gen.get("enemy_dmg_mult", 1.0))
+            applied["enemy_speed_mult"] = float(gen.get("enemy_speed_mult", 1.0))
+            applied["spawn_count"] = int(gen.get("spawn_count", 6))
+
+        if kind == "boss":
+            applied["spawn_count"] = 1
+
+        # spawn
+        for _ in range(applied["spawn_count"]):
+            ex = random.randint(arena.left+80, arena.right-80)
+            ey = random.randint(arena.top+80, arena.bottom-80)
+            hp = ENEMY_BASE_HP * applied["enemy_hp_mult"]
+            dmg = ENEMY_BASE_DMG * applied["enemy_dmg_mult"]
+            spd = ENEMY_SPEED * applied["enemy_speed_mult"]
+            if kind == "boss":
+                hp *= 4.0
+                dmg *= 1.7
+                spd *= 0.9
+            enemies.append(Enemy(ex, ey, hp=hp, dmg=dmg, speed=spd, aggro_r=ENEMY_AGGRO_R))
+
+    spawn_room(nodes[node_i].kind)
+
+    run_id = f"run_{random.randint(10000, 99999)}"
+    ensure_log_header()
+
+    state = "arena" 
+
+    def current_node():
+        return nodes[node_i]
+
+    def all_enemies_dead():
+        return all((not e.alive) for e in enemies)
+
+    def draw_ui():
+        hp_txt = f"HP {int(player.hp)}/{player.max_hp}"
+        ammo_txt = f"Ammo {player.magic_ammo}/{player.spell.ammo_max}"
+        gear_txt = f"W:{player.weapon.name} | S:{player.spell.name} | B:{player.boots.name} | A:{player.armor.name}"
+        node_txt = f"Node {node_i+1}/{len(nodes)} [{current_node().kind}]"
+        m = player.metrics
+        met_txt = f"K(M:{m.melee_kills} / Mg:{m.magic_kills}) Hits(M:{m.melee_hits} / Mg:{m.magic_hits})  Dmg(T:{m.damage_taken:.0f} / D:{m.damage_dealt:.0f})  Deaths:{m.deaths}"
+
+        screen.blit(font.render(node_txt, True, (230,230,230)), (12, 10))
+        screen.blit(font.render(hp_txt + "  " + ammo_txt, True, (230,230,230)), (12, 32))
+        screen.blit(font.render(gear_txt, True, (230,230,230)), (12, 54))
+        screen.blit(font.render(met_txt, True, (200,200,200)), (12, 76))
+
+        c = "WASD move | LMB melee | RMB magic | SPACE dash | SHIFT defend | ENTER continue"
+        screen.blit(font.render(c, True, (170,170,170)), (12, H-26))
+
+    def draw_center(text):
+        surf = big.render(text, True, (240,240,240))
+        screen.blit(surf, (W/2 - surf.get_width()/2, H/2 - surf.get_height()/2))
+
+    running = True
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    running = False
+                if ev.key == pygame.K_SPACE and state == "arena":
+                    player.try_dash()
+                if ev.key == pygame.K_RETURN:
+                    if state in ("map", "loot"):
+                        state = "arena"
+                        spawn_room(current_node().kind)
+                    elif state == "dead":
+                        append_run(run_id, player, applied)
+                        run_id = f"run_{random.randint(10000, 99999)}"
+                        player = Player(W/2, H/2)
+                        nodes = generate_node_map(10)
+                        node_i = 0
+                        spawn_room(nodes[node_i].kind)
+                        state = "arena"
+                    elif state == "win":
+                        append_run(run_id, player, applied)
+                        run_id = f"run_{random.randint(10000, 99999)}"
+                        player = Player(W/2, H/2)
+                        nodes = generate_node_map(10)
+                        node_i = 0
+                        spawn_room(nodes[node_i].kind)
+                        state = "arena"
+
+            if ev.type == pygame.MOUSEBUTTONDOWN and state == "arena":
+                if ev.button == 1:  # melee
+                    player.try_melee(enemies)
+                elif ev.button == 3:  # magic
+                    player.try_magic(projectiles)
+
+        screen.fill((18, 18, 24))
+
+        pygame.draw.rect(screen, (40, 40, 52), arena, border_radius=8)
+        pygame.draw.rect(screen, (80, 80, 100), arena, 2, border_radius=8)
+
+        keys = pygame.key.get_pressed()
+        mx, my = pygame.mouse.get_pos()
+        player.facing_deg = angle_deg(mx - player.x, my - player.y)
+
+        if state == "arena":
+            player.update(dt, keys, arena)
+
+            # update enemies
+            for e in enemies:
+                e.update(dt, player, arena)
+
+            for p in projectiles:
+                p.update(dt, arena)
+            projectiles = [p for p in projectiles if p.alive]
+
+            for p in projectiles:
+                for e in enemies:
+                    if not e.alive:
+                        continue
+                    if vec_len(e.x - p.x, e.y - p.y) <= (e.r + p.r):
+                        e.take_damage(p.dmg)
+                        player.metrics.magic_hits += 1
+                        player.metrics.damage_dealt += p.dmg
+                        p.alive = False
+                        break
+
+            # kill accounting + heal on kill
+            for e in enemies:
+                if e.alive:
+                    continue
+                if getattr(e, "_counted", False):
+                    continue
+                setattr(e, "_counted", True)
+
+
+                if vec_len(player.x - e.x, player.y - e.y) <= (MELEE_RANGE + e.r + 6):
+                    player.metrics.melee_kills += 1
+                else:
+                    player.metrics.magic_kills += 1
+                player.heal_on_kill()
+
+            if not player.alive:
+                state = "dead"
+                append_run(run_id, player, applied)
+            elif all_enemies_dead():
+                current_node().cleared = True
+                if current_node().kind == "boss":
+                    state = "win"
+                    append_run(run_id, player, applied)
+                else:
+                    state = "loot"
+                    roll_loot(player)
+                    node_i += 1
+                    if node_i >= len(nodes):
+                        state = "win"
+                        append_run(run_id, player, applied)
+
+        for e in enemies:
+            e.draw(screen)
+        for p in projectiles:
+            p.draw(screen)
+        player.draw(screen)
+
+        draw_ui()
+
+        if state == "loot":
+            draw_center("LOOT ACQUIRED — press ENTER")
+        elif state == "dead":
+            draw_center("YOU DIED — press ENTER")
+        elif state == "win":
+            draw_center("RUN COMPLETE — press ENTER")
+
+        pygame.display.flip()
+
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
