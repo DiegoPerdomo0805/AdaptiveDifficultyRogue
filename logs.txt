@@ -1,0 +1,1004 @@
+AttributeError: 'Armor' object has no attribute 'cd_mult'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x0000029A10F8EF30>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+loot
+False
+**************************************************
+1
+combat
+False
+**************************************************
+2
+loot
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+combat
+False
+**************************************************
+11
+elite
+False
+**************************************************
+12
+shop
+False
+**************************************************
+13
+loot
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+elite
+False
+**************************************************
+17
+shop
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 636, in main
+    roll_loot(player)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 399, in roll_loot
+    player.set_loadout(spell=item)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 251, in set_loadout
+    self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
+                                           ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Boots' object has no attribute 'ammo_max'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x0000015D69A4F170>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+elite
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+combat
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+loot
+False
+**************************************************
+6
+loot
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+loot
+False
+**************************************************
+11
+elite
+False
+**************************************************
+12
+combat
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+shop
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 528, in main
+    dt = clock.tick(FPS) / 1000.0
+         ^^^^^^^^^^^^^^^
+KeyboardInterrupt
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x00000261E934EEA0>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+loot
+False
+**************************************************
+1
+combat
+False
+**************************************************
+2
+combat
+False
+**************************************************
+3
+loot
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+elite
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+loot
+False
+**************************************************
+11
+combat
+False
+**************************************************
+12
+shop
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+elite
+False
+**************************************************
+17
+shop
+False
+**************************************************
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000001C61E88F110>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+combat
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+combat
+False
+**************************************************
+3
+loot
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+shop
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+elite
+False
+**************************************************
+11
+combat
+False
+**************************************************
+12
+loot
+False
+**************************************************
+13
+loot
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 594, in main
+    e.update(dt, player, arena)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 204, in update
+    player.receive_damage(self.dmg)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 262, in receive_damage
+    amount = max(0.0, raw_amount - self.armor.dmg_absorb)
+                                   ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Spell' object has no attribute 'dmg_absorb'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000001E6DFFDF260>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+combat
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+loot
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+elite
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+shop
+False
+**************************************************
+8
+loot
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+combat
+False
+**************************************************
+11
+elite
+False
+**************************************************
+12
+combat
+False
+**************************************************
+13
+loot
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 624, in main
+    player.heal_on_kill()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 256, in heal_on_kill
+    heal = int(HEAL_ON_KILL_BASE * self.weapon.heal_mult) + self.armor.heal_on_kill_bonus
+                                   ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Armor' object has no attribute 'heal_mult'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000001B8EB25EF60>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+elite
+False
+**************************************************
+1
+combat
+False
+**************************************************
+2
+shop
+False
+**************************************************
+3
+loot
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+loot
+False
+**************************************************
+11
+combat
+False
+**************************************************
+12
+shop
+shop
+False
+**************************************************
+13
+loot
+False
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 594, in main
+    e.update(dt, player, arena)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 204, in update
+    player.receive_damage(self.dmg)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 262, in receive_damage
+    amount = max(0.0, raw_amount - self.armor.dmg_absorb)
+                                   ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Boots' object has no attribute 'dmg_absorb'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000002A19A58F110>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+elite
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+loot
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+loot
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+combat
+False
+**************************************************
+11
+elite
+False
+**************************************************
+12
+shop
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+loot
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 636, in main
+    roll_loot(player)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 399, in roll_loot
+    player.set_loadout(spell=item)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 251, in set_loadout
+    self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
+                                           ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Weapon' object has no attribute 'ammo_max'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000002221038F110>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+combat
+False
+**************************************************
+1
+combat
+False
+**************************************************
+2
+combat
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+shop
+False
+**************************************************
+7
+shop
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+elite
+False
+**************************************************
+11
+elite
+False
+**************************************************
+12
+loot
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+loot
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+loot
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 636, in main
+    roll_loot(player)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 399, in roll_loot
+    player.set_loadout(spell=item)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 251, in set_loadout
+    self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
+                                           ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Boots' object has no attribute 'ammo_max'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000001B97FEAEFF0>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+elite
+False
+**************************************************
+1
+combat
+False
+**************************************************
+2
+shop
+False
+**************************************************
+3
+loot
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+elite
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+shop
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+loot
+False
+**************************************************
+10
+combat
+False
+**************************************************
+11
+combat
+False
+**************************************************
+12
+combat
+False
+**************************************************
+13
+loot
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 560, in main
+    player.try_melee(enemies)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 320, in try_melee
+    self.melee_cd = MELEE_CD_BASE * self.weapon.cd_mult
+                                    ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Armor' object has no attribute 'cd_mult'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000001DC7A63EF90>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+loot
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+loot
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+shop
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+combat
+False
+**************************************************
+10
+combat
+False
+**************************************************
+11
+combat
+False
+**************************************************
+12
+loot
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+elite
+False
+**************************************************
+17
+combat
+False
+**************************************************
+Traceback (most recent call last):
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 695, in <module>
+    main()
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 636, in main
+    roll_loot(player)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 399, in roll_loot
+    player.set_loadout(spell=item)
+  File "D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue\rogue.py", line 251, in set_loadout
+    self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
+                                           ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Armor' object has no attribute 'ammo_max'
+PS D:\DIEGO\UVG 2026\proyecto_graduación\AdaptiveDifficultyRogue> python .\rogue.py
+C:\Users\diego\AppData\Local\Programs\Python\Python312\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.10)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+--------------------------------------------------
+<node_map_gen.NodeMap object at 0x000002F67F52F050>
+4
+18 <class 'list'>
+--------------------------------------------------
+**************************************************
+0
+loot
+False
+**************************************************
+1
+shop
+False
+**************************************************
+2
+shop
+False
+**************************************************
+3
+combat
+False
+**************************************************
+4
+start
+False
+**************************************************
+5
+combat
+False
+**************************************************
+6
+combat
+False
+**************************************************
+7
+combat
+False
+**************************************************
+8
+combat
+False
+**************************************************
+9
+loot
+False
+**************************************************
+10
+elite
+False
+**************************************************
+11
+loot
+False
+**************************************************
+12
+combat
+False
+**************************************************
+13
+combat
+False
+**************************************************
+14
+combat
+False
+**************************************************
+15
+boss
+False
+**************************************************
+16
+combat
+False
+**************************************************
+17

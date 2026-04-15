@@ -7,6 +7,10 @@ from typing import List, Tuple, Optional, Dict
 
 import pygame
 
+from node_map_gen import NodeMap, MapNode, generate_node_map_graph
+
+
+
 
 W, H = 960, 540
 FPS = 60
@@ -31,7 +35,7 @@ HEAL_ON_KILL_BASE = 8
 
 ENEMY_BASE_HP = 42
 ENEMY_BASE_DMG = 9
-ENEMY_SPEED = 140.0
+ENEMY_SPEED = 110.0
 ENEMY_AGGRO_R = 260.0
 
 FONT_NAME = None
@@ -353,21 +357,7 @@ class Player:
 
 
 
-@dataclass
-class Node:
-    idx: int
-    kind: str  # "combat", "loot", "boss"
-    cleared: bool = False
 
-def generate_node_map(n=10) -> List[Node]:
-    nodes = []
-    for i in range(n):
-        if i == n - 1:
-            k = "boss"
-        else:
-            k = "loot" if random.random() < 0.25 else "combat"
-        nodes.append(Node(i, k, cleared=False))
-    return nodes
 
 
 def apply_model_tuning_if_available(player: Player):
@@ -460,10 +450,10 @@ def main():
 
     arena = pygame.Rect(ARENA_MARGIN, ARENA_MARGIN, W - 2*ARENA_MARGIN, H - 2*ARENA_MARGIN)
 
-    nodes = generate_node_map(10)
-    node_i = 0
+    node_map = generate_node_map_graph(18)
+    current_node_idx = node_map.start
 
-    applied = {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 6}
+    applied = {"enemy_hp_mult": 0.4, "enemy_dmg_mult": 0.3, "enemy_speed_mult": 0.25, "spawn_count": 2}
 
     player = Player(W/2, H/2)
 
@@ -475,7 +465,7 @@ def main():
         projectiles = []
         enemies = []
 
-        applied = {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 6}
+        applied = {"enemy_hp_mult": 0.4, "enemy_dmg_mult": 0.3, "enemy_speed_mult": 0.25, "spawn_count": 2}
 
         gen = apply_model_tuning_if_available(player)
         if gen:
@@ -500,7 +490,7 @@ def main():
                 spd *= 0.9
             enemies.append(Enemy(ex, ey, hp=hp, dmg=dmg, speed=spd, aggro_r=ENEMY_AGGRO_R))
 
-    spawn_room(nodes[node_i].kind)
+    spawn_room(node_map.nodes[current_node_idx].kind)
 
     run_id = f"run_{random.randint(10000, 99999)}"
     ensure_log_header()
@@ -508,7 +498,7 @@ def main():
     state = "arena" 
 
     def current_node():
-        return nodes[node_i]
+        return node_map.nodes[current_node_idx]
 
     def all_enemies_dead():
         return all((not e.alive) for e in enemies)
@@ -517,7 +507,7 @@ def main():
         hp_txt = f"HP {int(player.hp)}/{player.max_hp}"
         ammo_txt = f"Ammo {player.magic_ammo}/{player.spell.ammo_max}"
         gear_txt = f"W:{player.weapon.name} | S:{player.spell.name} | B:{player.boots.name} | A:{player.armor.name}"
-        node_txt = f"Node {node_i+1}/{len(nodes)} [{current_node().kind}]"
+        node_txt = f"Node [{current_node().kind}]"
         m = player.metrics
         met_txt = f"K(M:{m.melee_kills} / Mg:{m.magic_kills}) Hits(M:{m.melee_hits} / Mg:{m.magic_hits})  Dmg(T:{m.damage_taken:.0f} / D:{m.damage_dealt:.0f})  Deaths:{m.deaths}"
 
@@ -546,24 +536,23 @@ def main():
                 if ev.key == pygame.K_SPACE and state == "arena":
                     player.try_dash()
                 if ev.key == pygame.K_RETURN:
-                    if state in ("map", "loot"):
-                        state = "arena"
-                        spawn_room(current_node().kind)
+                    if state == "loot":
+                        state = "map"
                     elif state == "dead":
                         append_run(run_id, player, applied)
                         run_id = f"run_{random.randint(10000, 99999)}"
                         player = Player(W/2, H/2)
-                        nodes = generate_node_map(10)
-                        node_i = 0
-                        spawn_room(nodes[node_i].kind)
+                        node_map = generate_node_map_graph(18)
+                        current_node_idx = node_map.start
+                        spawn_room(node_map.nodes[current_node_idx].kind)
                         state = "arena"
                     elif state == "win":
                         append_run(run_id, player, applied)
                         run_id = f"run_{random.randint(10000, 99999)}"
                         player = Player(W/2, H/2)
-                        nodes = generate_node_map(10)
-                        node_i = 0
-                        spawn_room(nodes[node_i].kind)
+                        node_map = generate_node_map_graph(18)
+                        current_node_idx = node_map.start
+                        spawn_room(node_map.nodes[current_node_idx].kind)
                         state = "arena"
 
             if ev.type == pygame.MOUSEBUTTONDOWN and state == "arena":
@@ -571,6 +560,22 @@ def main():
                     player.try_melee(enemies)
                 elif ev.button == 3:  # magic
                     player.try_magic(projectiles)
+            if ev.type == pygame.MOUSEBUTTONDOWN and state == "map":
+                mx, my = ev.pos
+                # Check if clicked on a node
+                scale_x = arena.width / 820.0
+                scale_y = arena.height / 420.0
+                for i, node in enumerate(node_map.nodes):
+                    nx = arena.left + node.x * scale_x
+                    ny = arena.top + node.y * scale_y
+                    dist = vec_len(mx - nx, my - ny)
+                    if dist <= 20:  # node radius
+                        # Check if connected and not cleared
+                        if i in node_map.edges.get(current_node_idx, set()) and not node.cleared:
+                            current_node_idx = i
+                            state = "arena"
+                            spawn_room(node.kind)
+                            break
 
         screen.fill((18, 18, 24))
 
@@ -629,16 +634,50 @@ def main():
                 else:
                     state = "loot"
                     roll_loot(player)
-                    node_i += 1
-                    if node_i >= len(nodes):
-                        state = "win"
-                        append_run(run_id, player, applied)
 
         for e in enemies:
             e.draw(screen)
         for p in projectiles:
             p.draw(screen)
         player.draw(screen)
+
+        if state == "map":
+            # Draw the node map
+            scale_x = arena.width / 820.0
+            scale_y = arena.height / 420.0
+            # Draw edges
+            for a, nbrs in node_map.edges.items():
+                for b in nbrs:
+                    if a < b:  # avoid double draw
+                        ax = arena.left + node_map.nodes[a].x * scale_x
+                        
+                        ay = arena.top + node_map.nodes[a].y * scale_y
+                        bx = arena.left + node_map.nodes[b].x * scale_x
+                        by = arena.top + node_map.nodes[b].y * scale_y
+                        pygame.draw.line(screen, (100, 100, 100), (ax, ay), (bx, by), 2)
+            # Draw nodes
+            for i, node in enumerate(node_map.nodes):
+                nx = arena.left + node.x * scale_x
+                ny = arena.top + node.y * scale_y
+                color = (200, 200, 200)  # default
+                if node.kind == "start":
+                    color = (0, 255, 0)
+                elif node.kind == "boss":
+                    color = (255, 0, 0)
+                elif node.kind == "elite":
+                    color = (255, 165, 0)
+                elif node.kind == "shop":
+                    color = (255, 255, 0)
+                elif node.kind == "loot":
+                    color = (0, 255, 255)
+                elif node.kind == "combat":
+                    color = (0, 0, 255)
+                if node.cleared:
+                    color = (color[0]//2, color[1]//2, color[2]//2)  # dim
+                pygame.draw.circle(screen, color, (int(nx), int(ny)), 15)
+                if i == current_node_idx:
+                    pygame.draw.circle(screen, (255, 255, 255), (int(nx), int(ny)), 20, 2)  # highlight current
+            draw_center("Choose next node")
 
         draw_ui()
 

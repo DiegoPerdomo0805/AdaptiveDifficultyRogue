@@ -1,112 +1,8 @@
 import math
 import random
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Optional, Set
 
-
-
-@dataclass
-class MapNode:
-    idx: int
-    x: float
-    y: float
-    kind: str = "combat"   
-    cleared: bool = False
-
-class NodeMap:
-    def __init__(self, nodes: List[MapNode], edges: Dict[int, Set[int]], start: int, boss: int):
-        self.nodes = nodes
-        self.edges = edges
-        self.start = start
-        self.boss = boss
-
-    def neighbors(self, i: int) -> List[int]:
-        return list(self.edges.get(i, set()))
-
-
-
-
-def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    return math.hypot(a[0]-b[0], a[1]-b[1])
-
-def segments_intersect(p1, p2, q1, q2) -> bool:
-
-    def orient(a, b, c):
-        return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
-
-    def on_segment(a, b, c):
-        return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
-
-    o1 = orient(p1, p2, q1)
-    o2 = orient(p1, p2, q2)
-    o3 = orient(q1, q2, p1)
-    o4 = orient(q1, q2, p2)
-
-
-    if (o1 * o2 < 0) and (o3 * o4 < 0):
-        return True
-
-
-    if o1 == 0 and on_segment(p1, p2, q1): return True
-    if o2 == 0 and on_segment(p1, p2, q2): return True
-    if o3 == 0 and on_segment(q1, q2, p1): return True
-    if o4 == 0 and on_segment(q1, q2, p2): return True
-    return False
-
-
-
-
-def add_edge(edges: Dict[int, Set[int]], a: int, b: int):
-    if a == b: 
-        return
-    edges.setdefault(a, set()).add(b)
-    edges.setdefault(b, set()).add(a)
-
-def remove_edge(edges: Dict[int, Set[int]], a: int, b: int):
-    edges.get(a, set()).discard(b)
-    edges.get(b, set()).discard(a)
-
-def bfs_components(n: int, edges: Dict[int, Set[int]]) -> List[List[int]]:
-    seen = [False]*n
-    comps = []
-    for i in range(n):
-        if seen[i]:
-            continue
-        q = [i]
-        seen[i] = True
-        comp = []
-        while q:
-            u = q.pop()
-            comp.append(u)
-            for v in edges.get(u, set()):
-                if not seen[v]:
-                    seen[v] = True
-                    q.append(v)
-        comps.append(comp)
-    return comps
-
-def shortest_path(n: int, edges: Dict[int, Set[int]], start: int, goal: int) -> List[int]:
-    from collections import deque
-    prev = [-1]*n
-    dq = deque([start])
-    prev[start] = start
-    while dq:
-        u = dq.popleft()
-        if u == goal:
-            break
-        for v in edges.get(u, set()):
-            if prev[v] == -1:
-                prev[v] = u
-                dq.append(v)
-    if prev[goal] == -1:
-        return []
-    path = [goal]
-    while path[-1] != start:
-        path.append(prev[path[-1]])
-    path.reverse()
-    return path
-
-
+from node_map_gen import NodeMap, MapNode, add_edge, bfs_components, dist, segments_intersect, shortest_path
 
 
 def generate_node_map_graph(
@@ -124,14 +20,13 @@ def generate_node_map_graph(
 
     rng = random.Random(seed)
 
-    # Place nodes on a (rough) grid so edges can be strictly N/S/E/W.
+    # Place nodes on a (rough) grid so edges are strictly N/S/E/W.
     # This makes the generated graph behave like a 4-way dungeon map.
     cols = int(math.sqrt(node_count))
     if cols * cols < node_count:
         cols += 1
     rows = (node_count + cols - 1) // cols
 
-    # Compute evenly spaced grid coordinates within the bounds.
     x_coords = [
         margin + (width - 2 * margin) * (i / (cols - 1 if cols > 1 else 1))
         for i in range(cols)
@@ -167,7 +62,6 @@ def generate_node_map_graph(
 
     # Ensure connectivity along the grid in NESW directions.
     for i in range(node_count):
-        # compute row/col for node i
         r = i // cols
         c = i % cols
 
@@ -184,7 +78,6 @@ def generate_node_map_graph(
 
     # Add some additional cardinal edges to meet k_nearest.
     def cardinal_neighbors(i: int) -> List[int]:
-        # Only consider nodes aligned along x or y (N/S/E/W)
         base = nodes[i]
         candidates = []
         for j in range(node_count):
@@ -336,22 +229,3 @@ def generate_node_map_graph(
         nodes[i].kind = "loot"
 
     return NodeMap(nodes, edges, start, boss)
-
-def main():
-    node_map = generate_node_map_graph()
-    print('-'*50)
-    print(node_map)
-    print(node_map.start)
-    print(len(node_map.nodes), type(node_map.nodes))
-    print('-'*50)
-    for e in node_map.nodes:
-        print('*'*50)
-        # print(e)
-        # print(e.x)
-        # print(e.y)
-        print(e.idx)
-        print(e.kind)
-        print(e.cleared)
-    print('*'*50)
-
-main()
