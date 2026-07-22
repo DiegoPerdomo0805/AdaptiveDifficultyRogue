@@ -71,6 +71,33 @@ def build_targets(df: pd.DataFrame) -> np.ndarray:
 
 
 # ----------------------------
+# Loot bias targets derived from archetype labels.
+#
+# Shape: [weapon_w, spell_w, armor_w, boots_w]  (softmax-ready weights)
+# These are NOT learned from gameplay data (there is no loot feedback signal
+# in runs.csv). Instead we define archetype-specific target distributions and
+# train LootGenerator to reproduce them conditioned on the same archetype
+# soft-vector the difficulty GAN already uses.
+#
+# Archetype → preferred item categories:
+#   0 Knight   : weapon > armor > boots >> spell
+#   1 Berserker: armor > weapon > boots >> spell   (survives by being tanky)
+#   2 Sniper   : spell > boots > armor >> weapon
+# ----------------------------
+# Loot weight targets per archetype (unnormalised; softmax at runtime)
+LOOT_TARGETS_BY_ARCHETYPE = np.array([
+    [0.55, 0.05, 0.25, 0.15],  # 0 Knight
+    [0.30, 0.05, 0.45, 0.20],  # 1 Berserker
+    [0.05, 0.55, 0.20, 0.20],  # 2 Sniper
+], dtype=np.float32)
+
+
+def build_loot_targets(labels: np.ndarray) -> np.ndarray:
+    """Return per-sample loot weight targets based on archetype label."""
+    return LOOT_TARGETS_BY_ARCHETYPE[labels]
+
+
+# ----------------------------
 # Archetype classifier (simple, learned from labels derived from behavior)
 # ----------------------------
 def derive_archetype_labels(X: np.ndarray) -> np.ndarray:
@@ -109,7 +136,7 @@ class ArchetypeClassifier(nn.Module):
 
 
 # ----------------------------
-# cGAN
+# cGAN — difficulty
 # ----------------------------
 class Generator(nn.Module):
     def __init__(self, noise_dim=10, cond_dim=3, out_dim=4):
@@ -143,6 +170,35 @@ class Discriminator(nn.Module):
         return self.net(torch.cat([y, c], dim=1))
 
 
+# ----------------------------
+# LootGenerator — item category bias
+#
+# Maps (noise, archetype_soft_vec) → 4D loot weight vector (sigmoid).
+# Trained with MSE against archetype-derived target distributions; no
+# discriminator needed — the targets are deterministic per archetype so
+# a plain regressor is sufficient and stabler than a second GAN.
+# ----------------------------
+class LootGenerator(nn.Module):
+    """
+    Produces a 4-dim weight vector [weapon_w, spell_w, armor_w, boots_w].
+    Sigmoid outputs live in (0, 1); pass through softmax at runtime to get
+    a proper categorical distribution for weighted sampling.
+    """
+    def __init__(self, noise_dim=8, cond_dim=3, out_dim=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(noise_dim + cond_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, out_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z, c):
+        return self.net(torch.cat([z, c], dim=1))
+
+
 def one_hot(labels: torch.Tensor, n=3) -> torch.Tensor:
     return torch.eye(n, device=labels.device)[labels]
 
@@ -151,33 +207,42 @@ def train_models(df: pd.DataFrame, out_dir: str, epochs: int = 80, batch_size: i
     X = build_features(df)
     Y = build_targets(df)
     labels = derive_archetype_labels(X)
+    Y_loot = build_loot_targets(labels)
 
-    X_t = torch.tensor(X, dtype=torch.float32, device=device)
-    Y_t = torch.tensor(Y, dtype=torch.float32, device=device)
-    L_t = torch.tensor(labels, dtype=torch.long, device=device)
+    X_t      = torch.tensor(X,      dtype=torch.float32, device=device)
+    Y_t      = torch.tensor(Y,      dtype=torch.float32, device=device)
+    L_t      = torch.tensor(labels, dtype=torch.long,    device=device)
+    YL_t     = torch.tensor(Y_loot, dtype=torch.float32, device=device)
 
-    dataset = TensorDataset(X_t, Y_t, L_t)
+    dataset = TensorDataset(X_t, Y_t, L_t, YL_t)
     n_train = int(0.85 * len(dataset))
     train_set, val_set = random_split(dataset, [n_train, len(dataset) - n_train])
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False)
 
-    # 1) classifier
+    # ------------------------------------------------------------------
+    # 1) Archetype classifier
+    # ------------------------------------------------------------------
     clf = ArchetypeClassifier().to(device)
     opt_c = optim.Adam(clf.parameters(), lr=1e-3)
     ce = nn.CrossEntropyLoss()
 
     for ep in range(25):
         clf.train()
-        for xb, _, lb in train_loader:
+        for xb, _, lb, _ in train_loader:
             logits = clf(xb)
             loss = ce(logits, lb)
             opt_c.zero_grad()
             loss.backward()
             opt_c.step()
 
-    # 2) cGAN
+    clf.eval()
+    print("Classifier trained.")
+
+    # ------------------------------------------------------------------
+    # 2) Difficulty cGAN
+    # ------------------------------------------------------------------
     G = Generator().to(device)
     D = Discriminator().to(device)
     opt_g = optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
@@ -186,10 +251,10 @@ def train_models(df: pd.DataFrame, out_dir: str, epochs: int = 80, batch_size: i
 
     for ep in range(epochs):
         G.train(); D.train()
-        for xb, yb, _ in train_loader:
+        for xb, yb, _, _ in train_loader:
             with torch.no_grad():
                 c_logits = clf(xb)
-                c = torch.softmax(c_logits, dim=1)  # soft condition (3)
+                c = torch.softmax(c_logits, dim=1)  # soft archetype condition (3)
 
             bs = xb.size(0)
             real = torch.ones(bs, 1, device=device)
@@ -215,25 +280,60 @@ def train_models(df: pd.DataFrame, out_dir: str, epochs: int = 80, batch_size: i
             opt_g.step()
 
         if ep % 10 == 0 or ep == epochs - 1:
-            print(f"Epoch {ep:03d} | D {loss_d.item():.4f} | G {loss_g.item():.4f}")
+            print(f"[DiffGAN] Epoch {ep:03d} | D {loss_d.item():.4f} | G {loss_g.item():.4f}")
 
+    # ------------------------------------------------------------------
+    # 3) Loot generator (MSE regression against archetype loot targets)
+    #
+    # We do NOT need a discriminator here — the loot target distribution is
+    # fully determined by the archetype label, so a conditional regressor
+    # converges cleanly and avoids GAN instability for this sub-task.
+    # ------------------------------------------------------------------
+    LG = LootGenerator().to(device)
+    opt_lg = optim.Adam(LG.parameters(), lr=1e-3)
+    mse = nn.MSELoss()
+
+    loot_epochs = max(40, epochs // 2)
+    for ep in range(loot_epochs):
+        LG.train()
+        for xb, _, _, ylb in train_loader:
+            with torch.no_grad():
+                c_logits = clf(xb)
+                c = torch.softmax(c_logits, dim=1)
+
+            bs = xb.size(0)
+            z  = torch.randn(bs, 8, device=device)
+            loot_pred = LG(z, c)
+            loss_lg = mse(loot_pred, ylb)
+            opt_lg.zero_grad()
+            loss_lg.backward()
+            opt_lg.step()
+
+        if ep % 10 == 0 or ep == loot_epochs - 1:
+            print(f"[LootGen] Epoch {ep:03d} | MSE {loss_lg.item():.5f}")
+
+    # ------------------------------------------------------------------
+    # Save all three models
+    # ------------------------------------------------------------------
     os.makedirs(out_dir, exist_ok=True)
     torch.save(clf.state_dict(), os.path.join(out_dir, "classifier.pt"))
-    torch.save(G.state_dict(), os.path.join(out_dir, "generator.pt"))
-    print("Saved:", out_dir)
+    torch.save(G.state_dict(),   os.path.join(out_dir, "generator.pt"))
+    torch.save(LG.state_dict(),  os.path.join(out_dir, "loot_generator.pt"))
+    print("Saved to:", out_dir)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="CSV produced by game.py (runs.csv)")
-    ap.add_argument("--out", default="models", help="output dir for .pt weights")
+    ap.add_argument("--data",   required=True, help="CSV produced by rogue.py (runs.csv)")
+    ap.add_argument("--out",    default="models", help="output dir for .pt weights")
     ap.add_argument("--epochs", type=int, default=80)
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--batch",  type=int, default=64)
     args = ap.parse_args()
 
     df = pd.read_csv(args.data)
     if len(df) < 200:
-        print(f"[WARN] Only {len(df)} rows. GANs like data. Expect mediocre outputs until you log more runs.")
+        print(f"[WARN] Only {len(df)} rows. GANs like data. "
+              f"Expect mediocre outputs until you log more runs.")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_models(df, args.out, epochs=args.epochs, batch_size=args.batch, device=device)

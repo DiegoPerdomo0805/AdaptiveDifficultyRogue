@@ -1,0 +1,1 @@
+for /l %%x in (1,1,100) do python bot_runner.py --runs 200 --seed %%x
