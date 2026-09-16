@@ -1,17 +1,49 @@
+"""
+node_map_gen.py
+================
+Generates the dungeon layout as a sparse, tree-shaped graph of rooms placed
+on an actual grid, so that:
+
+  * every room's neighbours are physically N/S/E/W of it (a real floor plan,
+    not an abstract node graph) — this is what lets rogue.py let the player
+    walk between rooms instead of clicking a map.
+  * the layout is a spanning tree (grown with a randomized Prim's-style walk),
+    so there is never more than one route between any two rooms — this is
+    deliberately NOT a fully-connected mesh. Every room you can reach, you
+    reach by a single, specific path of doors.
+  * the boss room is placed at the room with the greatest tree-distance from
+    the start, so a path from start to boss is guaranteed to exist by
+    construction (it's the literal path used to compute that distance).
+  * only four room kinds exist: "nothing" (incl. the start room), "enemy",
+    "loot", "boss". No elites, no shops — kept deliberately simple.
+
+Rooms are still allowed a *few* extra doors beyond the spanning tree (see
+`extra_loops`) purely to avoid every dungeon being a single strict corridor
+with no interesting branching-and-rejoining, but the default is small and
+this never turns the layout into a mesh.
+"""
+
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
+# Cardinal directions and their opposites / (dcol, drow) deltas.
+OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
+DELTA = {"N": (0, -1), "S": (0, 1), "E": (1, 0), "W": (-1, 0)}
+
+ROOM_KINDS = ("nothing", "enemy", "loot", "boss")
 
 
 @dataclass
 class MapNode:
     idx: int
-    x: float
-    y: float
-    kind: str = "combat"   
+    col: int
+    row: int
+    kind: str = "nothing"
     cleared: bool = False
+    looted: bool = False   # has the loot pedestal in this room already been used?
+
 
 class NodeMap:
     def __init__(self, nodes: List[MapNode], edges: Dict[int, Set[int]], start: int, boss: int):
@@ -23,335 +55,178 @@ class NodeMap:
     def neighbors(self, i: int) -> List[int]:
         return list(self.edges.get(i, set()))
 
+    def direction(self, a: int, b: int) -> Optional[str]:
+        """Cardinal direction to walk from room `a` to reach room `b`.
+        Returns None if the rooms aren't grid-adjacent (shouldn't happen for
+        connected edges, since we only ever add edges between adjacent cells)."""
+        na, nb = self.nodes[a], self.nodes[b]
+        dc, dr = nb.col - na.col, nb.row - na.row
+        for d, (ddc, ddr) in DELTA.items():
+            if (ddc, ddr) == (dc, dr):
+                return d
+        return None
+
+    def doors(self, i: int) -> Dict[str, int]:
+        """{direction: neighbor_idx} for every connected neighbor of room i."""
+        out = {}
+        for j in self.neighbors(i):
+            d = self.direction(i, j)
+            if d is not None:
+                out[d] = j
+        return out
 
 
-
-def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    return math.hypot(a[0]-b[0], a[1]-b[1])
-
-def segments_intersect(p1, p2, q1, q2) -> bool:
-
-    def orient(a, b, c):
-        return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
-
-    def on_segment(a, b, c):
-        return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
-
-    o1 = orient(p1, p2, q1)
-    o2 = orient(p1, p2, q2)
-    o3 = orient(q1, q2, p1)
-    o4 = orient(q1, q2, p2)
+def _bfs_depths(node_count: int, edges: Dict[int, Set[int]], start: int) -> List[int]:
+    from collections import deque
+    depth = [-1] * node_count
+    depth[start] = 0
+    q = deque([start])
+    while q:
+        u = q.popleft()
+        for v in edges.get(u, set()):
+            if depth[v] == -1:
+                depth[v] = depth[u] + 1
+                q.append(v)
+    return depth
 
 
-    if (o1 * o2 < 0) and (o3 * o4 < 0):
-        return True
-
-
-    if o1 == 0 and on_segment(p1, p2, q1): return True
-    if o2 == 0 and on_segment(p1, p2, q2): return True
-    if o3 == 0 and on_segment(q1, q2, p1): return True
-    if o4 == 0 and on_segment(q1, q2, p2): return True
-    return False
-
-
-
-
-def add_edge(edges: Dict[int, Set[int]], a: int, b: int):
-    if a == b: 
-        return
+def _add_edge(edges: Dict[int, Set[int]], a: int, b: int):
     edges.setdefault(a, set()).add(b)
     edges.setdefault(b, set()).add(a)
 
-def remove_edge(edges: Dict[int, Set[int]], a: int, b: int):
-    edges.get(a, set()).discard(b)
-    edges.get(b, set()).discard(a)
 
-def bfs_components(n: int, edges: Dict[int, Set[int]]) -> List[List[int]]:
-    seen = [False]*n
-    comps = []
-    for i in range(n):
-        if seen[i]:
-            continue
-        q = [i]
-        seen[i] = True
-        comp = []
-        while q:
-            u = q.pop()
-            comp.append(u)
-            for v in edges.get(u, set()):
-                if not seen[v]:
-                    seen[v] = True
-                    q.append(v)
-        comps.append(comp)
-    return comps
+def compute_node_depth(node_map: NodeMap, start: int) -> List[int]:
+    """BFS from start; returns depth[i] for every node i.
 
-def shortest_path(n: int, edges: Dict[int, Set[int]], start: int, goal: int) -> List[int]:
-    from collections import deque
-    prev = [-1]*n
-    dq = deque([start])
-    prev[start] = start
-    while dq:
-        u = dq.popleft()
-        if u == goal:
-            break
-        for v in edges.get(u, set()):
-            if prev[v] == -1:
-                prev[v] = u
-                dq.append(v)
-    if prev[goal] == -1:
-        return []
-    path = [goal]
-    while path[-1] != start:
-        path.append(prev[path[-1]])
-    path.reverse()
-    return path
-
-
+    Single shared implementation — previously duplicated near-identically in
+    both rogue.py and bot_runner.py.
+    """
+    return _bfs_depths(len(node_map.nodes), node_map.edges, start)
 
 
 def generate_node_map_graph(
-    node_count: int = 18,
-    width: int = 820,
-    height: int = 420,
-    margin: int = 40,
-    min_sep: float = 55.0,
-    k_nearest: int = 3,
-    max_degree: int = 4,
-    allow_crossings: bool = False,
-    extra_edges: int = 3,
+    node_count: int = 16,
+    cols: int = 6,
+    rows: int = 6,
+    extra_loops: int = 2,
+    enemy_weight: float = 0.55,
+    loot_weight: float = 0.22,
     seed: Optional[int] = None,
 ) -> NodeMap:
+    """
+    Grow a branching, tree-shaped dungeon on a `cols` x `rows` grid.
 
+    Algorithm (randomized Prim's-style growth — produces a spanning tree by
+    construction, i.e. never a fully-connected mesh):
+      1. Start from a random cell; mark it visited.
+      2. Maintain a frontier of (visited_cell -> unvisited_adjacent_cell) pairs.
+      3. Repeatedly pick a random frontier pair, carve a door between them,
+         mark the new cell visited, and add its own unvisited neighbours to
+         the frontier. Stop once `node_count` cells are visited (or the grid
+         is exhausted).
+      4. Optionally add a handful of `extra_loops` extra doors between
+         already-adjacent visited cells that aren't yet connected, purely for
+         minor branch variety. Kept small on purpose.
+      5. The start room is the first cell visited. The boss room is whichever
+         visited cell has the greatest tree-distance (BFS depth) from start —
+         guaranteeing a path from start to boss exists.
+      6. Remaining rooms are randomly assigned "enemy" / "loot" / "nothing"
+         by weight.
+    """
     rng = random.Random(seed)
 
-    # Place nodes on a (rough) grid so edges can be strictly N/S/E/W.
-    # This makes the generated graph behave like a 4-way dungeon map.
-    cols = int(math.sqrt(node_count))
-    if cols * cols < node_count:
-        cols += 1
-    rows = (node_count + cols - 1) // cols
+    if node_count > cols * rows:
+        # Grow the grid just enough to fit the requested room count.
+        side = int(math.ceil(math.sqrt(node_count)))
+        cols = rows = side
 
-    # Compute evenly spaced grid coordinates within the bounds.
-    x_coords = [
-        margin + (width - 2 * margin) * (i / (cols - 1 if cols > 1 else 1))
-        for i in range(cols)
-    ]
-    y_coords = [
-        margin + (height - 2 * margin) * (i / (rows - 1 if rows > 1 else 1))
-        for i in range(rows)
-    ]
+    def cell_id(c, r):
+        return r * cols + c
 
-    nodes: List[MapNode] = []
-    for r in range(rows):
-        for c in range(cols):
-            if len(nodes) >= node_count:
-                break
-            nodes.append(MapNode(idx=len(nodes), x=x_coords[c], y=y_coords[r]))
-        if len(nodes) >= node_count:
-            break
+    def in_bounds(c, r):
+        return 0 <= c < cols and 0 <= r < rows
 
-    far = (0, 1, -1.0)
-    for i in range(node_count):
-        for j in range(i + 1, node_count):
-            d = dist((nodes[i].x, nodes[i].y), (nodes[j].x, nodes[j].y))
-            if d > far[2]:
-                far = (i, j, d)
-    start, boss = far[0], far[1]
-    nodes[start].kind = "start"
-    nodes[boss].kind = "boss"
-
-    def is_cardinal(a: MapNode, b: MapNode, tol: float = 1e-6) -> bool:
-        return abs(a.x - b.x) < tol or abs(a.y - b.y) < tol
-
+    start_c, start_r = rng.randrange(cols), rng.randrange(rows)
+    start_cell = cell_id(start_c, start_r)
+    visited: Set[int] = {start_cell}
+    coord_of: Dict[int, Tuple[int, int]] = {start_cell: (start_c, start_r)}
     edges: Dict[int, Set[int]] = {}
 
-    # Ensure connectivity along the grid in NESW directions.
-    for i in range(node_count):
-        # compute row/col for node i
-        r = i // cols
-        c = i % cols
+    # Frontier: list of (visited_cell_id, unvisited_cell_id) candidate doors.
+    frontier: List[Tuple[int, int]] = []
 
-        # connect to east neighbor
-        if c + 1 < cols:
-            j = i + 1
-            if j < node_count:
-                add_edge(edges, i, j)
+    def push_frontier(cid, c, r):
+        for d, (dc, dr) in DELTA.items():
+            nc, nr = c + dc, r + dr
+            if in_bounds(nc, nr):
+                nid = cell_id(nc, nr)
+                if nid not in visited:
+                    frontier.append((cid, nid))
 
-        # connect to south neighbor
-        j = i + cols
-        if j < node_count:
-            add_edge(edges, i, j)
+    push_frontier(start_cell, start_c, start_r)
 
-    # Add some additional cardinal edges to meet k_nearest.
-    def cardinal_neighbors(i: int) -> List[int]:
-        # Only consider nodes aligned along x or y (N/S/E/W)
-        base = nodes[i]
-        candidates = []
-        for j in range(node_count):
-            if i == j:
-                continue
-            if not is_cardinal(base, nodes[j]):
-                continue
-            candidates.append((dist((base.x, base.y), (nodes[j].x, nodes[j].y)), j))
-        candidates.sort(key=lambda t: t[0])
-        return [j for _, j in candidates]
+    while len(visited) < node_count and frontier:
+        pick = rng.randrange(len(frontier))
+        a_id, b_id = frontier.pop(pick)
+        if b_id in visited:
+            continue  # became visited via another frontier edge meanwhile
+        bc, br = b_id % cols, b_id // cols
+        visited.add(b_id)
+        coord_of[b_id] = (bc, br)
+        _add_edge(edges, a_id, b_id)
+        push_frontier(b_id, bc, br)
 
-    for i in range(node_count):
-        neighbors = cardinal_neighbors(i)[:k_nearest]
-        for j in neighbors:
-            add_edge(edges, i, j)
+    # Re-index visited cells 0..N-1 in a stable order (grid scan order) so
+    # MapNode indices are compact regardless of grid size.
+    ordered_cell_ids = sorted(visited)
+    remap = {cell_id_: i for i, cell_id_ in enumerate(ordered_cell_ids)}
 
+    nodes: List[MapNode] = []
+    for cell_id_ in ordered_cell_ids:
+        c, r = coord_of[cell_id_]
+        nodes.append(MapNode(idx=remap[cell_id_], col=c, row=r))
 
-    def edge_list():
-        seen = set()
-        out = []
-        for a, nbrs in edges.items():
-            for b in nbrs:
-                if (b, a) in seen:
-                    continue
-                seen.add((a, b))
-                out.append((a, b))
-        return out
+    remapped_edges: Dict[int, Set[int]] = {}
+    for a_id, nbrs in edges.items():
+        for b_id in nbrs:
+            _add_edge(remapped_edges, remap[a_id], remap[b_id])
 
-    def degree(i): 
-        return len(edges.get(i, set()))
+    start_idx = remap[start_cell]
 
-
-    for i in range(node_count):
-        while degree(i) > max_degree:
-            nbrs = list(edges[i])
-            nbrs.sort(key=lambda j: dist((nodes[i].x, nodes[i].y), (nodes[j].x, nodes[j].y)), reverse=True)
-            remove_edge(edges, i, nbrs[0])
-
-
-    if not allow_crossings:
-        changed = True
-        while changed:
-            changed = False
-            el = edge_list()
-            for a, b in el:
-                p1 = (nodes[a].x, nodes[a].y)
-                p2 = (nodes[b].x, nodes[b].y)
-                for c, d in el:
-                    if len({a, b, c, d}) < 4:
-                        continue  
-                    q1 = (nodes[c].x, nodes[c].y)
-                    q2 = (nodes[d].x, nodes[d].y)
-                    if segments_intersect(p1, p2, q1, q2):
-                        dab = dist(p1, p2)
-                        dcd = dist(q1, q2)
-                        if dab >= dcd:
-                            remove_edge(edges, a, b)
-                        else:
-                            remove_edge(edges, c, d)
-                        changed = True
-                        break
-                if changed:
-                    break
-
-
-    comps = bfs_components(node_count, edges)
-    while len(comps) > 1:
-        comp_a = comps[0]
-        comp_b = comps[1]
-        best = (None, None, 1e18)
-        for i in comp_a:
-            for j in comp_b:
-                d = dist((nodes[i].x, nodes[i].y), (nodes[j].x, nodes[j].y))
-                if d < best[2]:
-                    best = (i, j, d)
-        add_edge(edges, best[0], best[1])
-        comps = bfs_components(node_count, edges)
-
-    path = shortest_path(node_count, edges, start, boss)
-    if not path:
-        add_edge(edges, start, boss)
-        path = shortest_path(node_count, edges, start, boss)
-        if not path:
-            raise RuntimeError("Failed to guarantee start->boss path.")
-
-
-    def can_add(a, b) -> bool:
-        # Only allow NESW connections (no diagonals)
-        if not is_cardinal(nodes[a], nodes[b]):
-            return False
-        if b in edges.get(a, set()):
-            return False
-        if degree(a) >= max_degree or degree(b) >= max_degree:
-            return False
-        if not allow_crossings:
-            p1 = (nodes[a].x, nodes[a].y)
-            p2 = (nodes[b].x, nodes[b].y)
-            for c, d in edge_list():
-                if len({a, b, c, d}) < 4:
-                    continue
-                q1 = (nodes[c].x, nodes[c].y)
-                q2 = (nodes[d].x, nodes[d].y)
-                if segments_intersect(p1, p2, q1, q2):
-                    return False
-        return True
-
-    tries = 0
+    # A handful of extra doors between grid-adjacent visited rooms that
+    # aren't already connected — kept small so it never becomes a mesh.
+    n = len(nodes)
+    coord_to_idx = {(nd.col, nd.row): nd.idx for nd in nodes}
     added = 0
-    while added < extra_edges and tries < 2000:
+    tries = 0
+    while added < extra_loops and tries < 200:
         tries += 1
-        a = rng.randrange(node_count)
-        b = rng.randrange(node_count)
-        if a == b:
+        i = rng.randrange(n)
+        ni = nodes[i]
+        d = rng.choice(list(DELTA.keys()))
+        dc, dr = DELTA[d]
+        j = coord_to_idx.get((ni.col + dc, ni.row + dr))
+        if j is None or j == i:
             continue
-        # Only add additional edges along NESW directions.
-        if not is_cardinal(nodes[a], nodes[b]):
+        if j in remapped_edges.get(i, set()):
             continue
-        d = dist((nodes[a].x, nodes[a].y), (nodes[b].x, nodes[b].y))
-        if d < min_sep * 1.2 or d > min_sep * 4.0:
+        _add_edge(remapped_edges, i, j)
+        added += 1
+
+    # Boss = farthest room from start by tree distance -> guarantees a path.
+    depths = _bfs_depths(n, remapped_edges, start_idx)
+    boss_idx = max(range(n), key=lambda i: depths[i])
+
+    nodes[start_idx].kind = "nothing"
+    nodes[boss_idx].kind = "boss"
+
+    # Assign remaining kinds by weight.
+    nothing_weight = max(0.0, 1.0 - enemy_weight - loot_weight)
+    kinds = ["enemy", "loot", "nothing"]
+    weights = [enemy_weight, loot_weight, nothing_weight]
+    for nd in nodes:
+        if nd.idx in (start_idx, boss_idx):
             continue
-        if can_add(a, b):
-            add_edge(edges, a, b)
-            added += 1
+        nd.kind = rng.choices(kinds, weights=weights, k=1)[0]
 
-    path_set = set(path)
-    sd = [(dist((nodes[i].x, nodes[i].y), (nodes[start].x, nodes[start].y)), i) for i in range(node_count)]
-    sd.sort()
-    ordered = [i for _, i in sd]
-
-    for i in ordered:
-        if i in (start, boss):
-            continue
-        nodes[i].kind = "combat"
-
-    mid = ordered[node_count//3: 2*node_count//3]
-    far_nodes = ordered[2*node_count//3:]
-
-    for i in rng.sample(mid, k=min(2, len(mid))):
-        if nodes[i].kind not in ("start", "boss"):
-            nodes[i].kind = "shop"
-
-    for i in rng.sample(far_nodes, k=min(2, len(far_nodes))):
-        if nodes[i].kind not in ("start", "boss"):
-            nodes[i].kind = "elite"
-
-    candidates = [i for i in range(node_count) if nodes[i].kind == "combat"]
-    loot_n = max(2, int(0.25 * len(candidates)))
-    for i in rng.sample(candidates, k=min(loot_n, len(candidates))):
-        nodes[i].kind = "loot"
-
-    return NodeMap(nodes, edges, start, boss)
-
-def main():
-    node_map = generate_node_map_graph()
-    print('-'*50)
-    print(node_map)
-    print(node_map.start)
-    print(len(node_map.nodes), type(node_map.nodes))
-    print('-'*50)
-    for e in node_map.nodes:
-        print('*'*50)
-        # print(e)
-        # print(e.x)
-        # print(e.y)
-        print(e.idx)
-        print(e.kind)
-        print(e.cleared)
-    print('*'*50)
-
-main()
+    return NodeMap(nodes, remapped_edges, start_idx, boss_idx)
