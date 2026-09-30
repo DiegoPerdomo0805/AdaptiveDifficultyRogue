@@ -7,39 +7,28 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
+# Single source of truth for the 6-dim feature vector (see dda_core.py) —
+# this used to be a third independent reimplementation of the same formula
+# used in rogue.py and train_cgan.py.
+import dda_core
+
 
 # ----------------------------
 # Conditioning vector = your thesis metrics
 # ----------------------------
 def build_features(df: pd.DataFrame) -> np.ndarray:
-    # Convert raw counters into stable features
-    melee_k = df["melee_kills"].to_numpy(dtype=np.float32)
-    magic_k = df["magic_kills"].to_numpy(dtype=np.float32)
-    melee_h = df["melee_hits"].to_numpy(dtype=np.float32)
-    magic_h = df["magic_hits"].to_numpy(dtype=np.float32)
-    dmg_taken = df["damage_taken"].to_numpy(dtype=np.float32)
-    dmg_dealt = df["damage_dealt"].to_numpy(dtype=np.float32)
-    deaths = df["deaths"].to_numpy(dtype=np.float32)
-    time_alive = df["time_alive"].to_numpy(dtype=np.float32)
-
-    total_k = melee_k + magic_k
-    melee_ratio = np.where(total_k > 0, melee_k / total_k, 0.5)
-    magic_ratio = np.where(total_k > 0, magic_k / total_k, 0.5)
-
-    hpk_melee = np.where(melee_k > 0, melee_h / melee_k, melee_h + 1.0)
-    hpk_magic = np.where(magic_k > 0, magic_h / magic_k, magic_h + 1.0)
-
-    dmg_ratio = np.where(dmg_dealt > 1e-6, dmg_taken / dmg_dealt, 1.0)
-    death_rate = np.where(time_alive > 1e-6, (deaths / time_alive) * 60.0, 0.0)  # per minute
-
-    # clamp
-    hpk_melee = np.clip(hpk_melee, 0.0, 10.0)
-    hpk_magic = np.clip(hpk_magic, 0.0, 10.0)
-    dmg_ratio = np.clip(dmg_ratio, 0.0, 5.0)
-    death_rate = np.clip(death_rate, 0.0, 5.0)
-
-    X = np.stack([melee_ratio, magic_ratio, hpk_melee, hpk_magic, dmg_ratio, death_rate], axis=1)
-    return X.astype(np.float32)
+    """Row-wise delegate to dda_core.feature_vector_from_raw(). A Python loop
+    over a few thousand rows is negligible next to GAN training time, and it
+    guarantees this can never silently drift from rogue.py's live feature
+    computation the way the old hand-vectorised version could."""
+    rows = [
+        dda_core.feature_vector_from_raw(
+            r.melee_kills, r.magic_kills, r.melee_hits, r.magic_hits,
+            r.damage_taken, r.damage_dealt, r.deaths, r.time_alive,
+        )
+        for r in df.itertuples(index=False)
+    ]
+    return np.asarray(rows, dtype=np.float32)
 
 
 # ----------------------------
@@ -84,11 +73,13 @@ def build_targets(df: pd.DataFrame) -> np.ndarray:
 #   1 Berserker: armor > weapon > boots >> spell   (survives by being tanky)
 #   2 Sniper   : spell > boots > armor >> weapon
 # ----------------------------
-# Loot weight targets per archetype (unnormalised; softmax at runtime)
+# Loot weight targets per archetype (unnormalised; softmax at runtime).
+# Pulled from dda_core so this table can never drift from the one
+# rule_based_dda() uses live in rogue.py/bot_runner.py.
 LOOT_TARGETS_BY_ARCHETYPE = np.array([
-    [0.55, 0.05, 0.25, 0.15],  # 0 Knight
-    [0.30, 0.05, 0.45, 0.20],  # 1 Berserker
-    [0.05, 0.55, 0.20, 0.20],  # 2 Sniper
+    dda_core.LOOT_BIAS_KNIGHT,     # 0 Knight
+    dda_core.LOOT_BIAS_BERSERKER,  # 1 Berserker
+    dda_core.LOOT_BIAS_SNIPER,     # 2 Sniper
 ], dtype=np.float32)
 
 

@@ -1,7 +1,8 @@
 import math
 import os
-import csv
 import random
+import sys
+import uuid
 from typing import List, Tuple, Optional, Dict
 
 import pygame
@@ -22,14 +23,18 @@ from dda_core import (
     ENEMY_DASH_TIME, ENEMY_DASH_RECOVER,
     knockback_impulse, apply_knockback_decay,
     Weapon, Spell, Boots, Armor, WEAPONS, SPELLS, BOOTS, ARMORS,
-    CombatMetrics, rule_based_dda,
+    CombatMetrics, rule_based_dda, effective_applied_config,
 )
+import telemetry
 
 FPS = 60
 FONT_NAME = None
 
-ENABLE_MODEL = False
-MODEL_DIR = "models"
+ENABLE_MODEL = os.environ.get("ROGUE_ENABLE_MODEL", "0") == "1"
+MODEL_DIR = os.environ.get(
+    "ROGUE_MODEL_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_out"),
+)
 
 # Doorway geometry: how wide the walkable opening in a wall is, and how far
 # past the wall the player has to walk before the room transition fires.
@@ -61,39 +66,52 @@ def angle_diff_deg(a, b):
     return d
 
 
-def apply_model_tuning_if_available(player: "Player", node_depth: int = 0) -> Optional[dict]:
+# ---------------------------------------------------------------------------
+# Model loading -- isolated from cwd via spec_from_file_location, matching
+# EXACTLY the API model_runtime.LoadedModels actually exposes
+# (predict(cond_vec) -> dict), not an older "generate(features)" shape that
+# never matched what model_runtime.py implements.
+# ---------------------------------------------------------------------------
+
+_model_runtime = None
+_loaded_models = None
+_model_load_failed = False
+
+
+def apply_model_tuning_if_available(cond_vec: List[float], fallback: dict) -> dict:
     """
-    Tries the cGAN model first; falls back to rule_based_dda transparently.
-
-    The returned dict always contains both difficulty keys AND a 'loot_bias'
-    key ([weapon_w, spell_w, armor_w, boots_w]) so generate_loot_options can
-    do archetype-aware weighted sampling without needing a separate call.
+    Returns a rule_based_dda()-shaped dict (enemy_hp_mult/enemy_dmg_mult/
+    enemy_speed_mult/spawn_count/loot_bias), either from the trained model
+    (if ENABLE_MODEL and it loads/validates successfully) or `fallback`
+    (the heuristic's own output). Any failure to load, a version mismatch,
+    or a runtime error falls back SAFELY to the heuristic instead of
+    crashing the game -- and is only attempted once per process (a broken
+    model doesn't retry every single room).
     """
-    if ENABLE_MODEL:
-        try:
-            import torch
-            from model_runtime import LoadedModels
-            global _LOADED
-            if "_LOADED" not in globals():
-                _LOADED = LoadedModels.load(MODEL_DIR)
+    global _model_runtime, _loaded_models, _model_load_failed
+    if not ENABLE_MODEL or _model_load_failed:
+        return fallback
+    try:
+        if _model_runtime is None:
+            import importlib.util
+            this_dir = os.path.dirname(os.path.abspath(__file__))
+            spec = importlib.util.spec_from_file_location(
+                "model_runtime", os.path.join(this_dir, "model_runtime.py"))
+            if spec is None or spec.loader is None:
+                raise ImportError("Could not load model_runtime.py")
+            _model_runtime = importlib.util.module_from_spec(spec)
+            sys.modules["model_runtime"] = _model_runtime
+            spec.loader.exec_module(_model_runtime)
+        if _loaded_models is None:
+            _loaded_models = _model_runtime.LoadedModels.load(MODEL_DIR)
 
-            features = torch.tensor([player.metrics.to_feature_vector()], dtype=torch.float32)
-
-            gen = _LOADED.generate(features)
-            if gen:
-                try:
-                    loot_bias = _LOADED.generate_loot_bias(features)
-                    if loot_bias:
-                        gen["loot_bias"] = loot_bias
-                    else:
-                        gen.setdefault("loot_bias", core.loot_bias_for_metrics(player.metrics))
-                except Exception:
-                    gen.setdefault("loot_bias", core.loot_bias_for_metrics(player.metrics))
-                return gen
-        except Exception as e:
-            print("[MODEL] Failed to load/apply model:", e)
-
-    return rule_based_dda(player.metrics, node_depth)
+        pred = _loaded_models.predict(cond_vec)
+        pred["loot_bias"] = fallback.get("loot_bias", [0.25, 0.25, 0.25, 0.25])
+        return pred
+    except Exception as e:
+        print(f"[MODEL] Falling back to heuristic DDA: {e}", file=sys.stderr)
+        _model_load_failed = True
+        return fallback
 
 
 ### ============= Entity Classes ======== ###
@@ -266,6 +284,9 @@ class Player:
         # unlocked doorway far enough to trigger a room transition.
         self.exit_dir: Optional[str] = None
 
+    def hp_ratio(self) -> float:
+        return core.clamp(self.hp / self.max_hp, 0.0, 1.0)
+
     def set_loadout(self, weapon=None, spell=None, boots=None, armor=None):
         if weapon: self.weapon = weapon
         if spell:
@@ -420,32 +441,10 @@ def generate_loot_options(
     count: int = 3,
     loot_bias: Optional[List[float]] = None,
 ) -> List[Tuple[str, object]]:
-    """
-    Generate `count` loot choices weighted by `loot_bias`.
-
-    loot_bias is a 4-element weight vector [weapon_w, spell_w, armor_w, boots_w]
-    produced either by the LootGenerator model or the rule-based fallback.
-    """
-    KINDS = ["weapon", "spell", "armor", "boots"]
-    POOLS = {
-        "weapon": WEAPONS,
-        "spell": SPELLS,
-        "armor": ARMORS,
-        "boots": BOOTS,
-    }
-
-    if loot_bias is not None and len(loot_bias) == 4 and sum(loot_bias) > 0:
-        total = sum(loot_bias)
-        weights = [w / total for w in loot_bias]
-    else:
-        weights = [0.25, 0.25, 0.25, 0.25]
-
-    options: List[Tuple[str, object]] = []
-    for _ in range(count):
-        kind = random.choices(KINDS, weights=weights, k=1)[0]
-        item = random.choice(POOLS[kind])
-        options.append((kind, item))
-    return options
+    """Thin wrapper over dda_core.generate_loot_options — kept here so the
+    rest of rogue.py's call sites don't change, but the actual weighted
+    sampling logic is the single copy shared with bot_runner.py."""
+    return core.generate_loot_options(loot_bias=loot_bias, count=count)
 
 
 def describe_loot_option(kind: str, item: object) -> List[str]:
@@ -477,52 +476,179 @@ def apply_loot_choice(player: Player, choice: Tuple[str, object]):
 
 
 # ---------------------------------------------------------------------------
-# CSV logging
+# Per-room telemetry (finding #8): begin_room() / finalize_room() sharing
+# the EXACT same telemetry.RoomSample/ROOM_SAMPLE_COLUMNS contract as
+# bot_runner.py, so human and synthetic data merge cleanly. Human combat
+# logic (above) is NOT shared with the bot's abstract resolver -- only
+# this telemetry CONTRACT is shared, as intended.
+#
+# Room-visit semantics mirror bot_runner's DFS: a telemetry sample is only
+# produced the FIRST time a room is entered (node.cleared == False at
+# entry). Backtracking into an already-cleared room does not re-spawn
+# enemies and does not produce a duplicate/meaningless sample.
 # ---------------------------------------------------------------------------
 
-LOG_FILE = "runs.csv"
+class RoomTelemetrySession:
+    def __init__(self, writer: "telemetry.ShardWriter", node_map: NodeMap, run_id: str):
+        self.writer = writer
+        self.node_map = node_map
+        self.run_id = run_id
+        self.depths = compute_node_depth(node_map, node_map.start)
+        self.total_rooms = len(node_map.nodes)
+        self.recent = telemetry.RecentWindow()
+        self.cleared_count = 0
+        self.room_seq = 0
+        self._pending: Optional[dict] = None
 
-def ensure_log_header():
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([
-                "run_id",
-                "melee_kills", "magic_kills",
-                "melee_hits", "magic_hits",
-                "damage_taken", "damage_dealt",
-                "deaths", "time_alive",
-                "weapon", "spell", "boots", "armor",
-                "enemy_hp_mult", "enemy_dmg_mult", "enemy_speed_mult", "spawn_count",
-                "heal_on_kill_base",
-            ])
+    @property
+    def pending(self) -> bool:
+        return self._pending is not None
 
-def append_run(run_id: str, player: Player, applied: Dict[str, float]):
-    """
-    Logs exactly one row per finished run.
+    def begin_room(self, room_idx: int, player: Player) -> dict:
+        assert self._pending is None, (
+            "begin_room() called while a previous room's sample was still "
+            "pending -- every room must be finalize_room()'d before the "
+            "next one begins."
+        )
+        node = self.node_map.nodes[room_idx]
+        depth = self.depths.get(room_idx, 0)
+        progress_norm = core.clamp(self.cleared_count / max(self.total_rooms, 1), 0.0, 1.0)
+        is_combat = 1 if node.kind in ("enemy", "boss") else 0
 
-    FIX: this used to be called twice per run — once when `state` flipped to
-    "dead"/"win", and again when ENTER was pressed to acknowledge that
-    screen — silently duplicating every human-played run in runs.csv. Now
-    there is exactly one call site (the state transition itself, in main());
-    the ENTER handler only resets for the next run.
-    """
-    ensure_log_header()
-    m = player.metrics
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            run_id,
-            m.melee_kills, m.magic_kills,
-            m.melee_hits, m.magic_hits,
-            round(m.damage_taken, 3), round(m.damage_dealt, 3),
-            m.deaths, round(m.time_alive, 3),
-            player.weapon.name, player.spell.name,
-            player.boots.name, player.armor.name,
-            applied["enemy_hp_mult"], applied["enemy_dmg_mult"],
-            applied["enemy_speed_mult"], applied["spawn_count"],
-            HEAL_ON_KILL_BASE,
-        ])
+        pre = telemetry.metrics_snapshot(player.metrics)
+        pre_hp_ratio = player.hp_ratio()
+        recent_totals = self.recent.totals()
+        recent_n = self.recent.n_rooms()
+
+        # Official condition contract (finding #3): behavioral components
+        # from the recent window; hp_ratio instantaneous; kills/depth/
+        # progress cumulative & contextual. Falls back to cumulative-so-far
+        # if the window is still empty (first room of the run).
+        if recent_n > 0:
+            mk, gk = recent_totals["melee_kills"], recent_totals["magic_kills"]
+            mh, gh = recent_totals["melee_hits"], recent_totals["magic_hits"]
+            dt_, dd_ = recent_totals["damage_taken"], recent_totals["damage_dealt"]
+        else:
+            mk, gk = pre["melee_kills"], pre["magic_kills"]
+            mh, gh = pre["melee_hits"], pre["magic_hits"]
+            dt_, dd_ = pre["damage_taken"], pre["damage_dealt"]
+
+        cond_vec = core.feature_vector_from_raw(
+            mk, gk, mh, gh, dt_, dd_, pre_hp_ratio, depth, progress_norm,
+        )
+
+        applied_raw = rule_based_dda(player.metrics, node_depth=depth, hp_ratio=pre_hp_ratio)
+        applied_raw = apply_model_tuning_if_available(cond_vec, applied_raw)
+        # Single choke point (finding #5): boss multipliers folded in HERE,
+        # so what's returned to spawn_room() to build enemies IS what gets
+        # logged -- they can never diverge again.
+        applied = effective_applied_config(applied_raw, node.kind)
+
+        self.room_seq += 1
+        self._pending = {
+            "room_idx": room_idx, "room_kind": node.kind, "depth": depth,
+            "progress_norm": progress_norm, "is_combat": is_combat,
+            "pre": pre, "pre_hp_ratio": pre_hp_ratio,
+            "recent_totals": recent_totals, "recent_n": recent_n,
+            "cond_vec": cond_vec, "applied_raw": applied_raw, "applied": applied,
+            "room_seq": self.room_seq,
+        }
+        return applied
+
+    def finalize_room(self, player: Player, room_result: str, loot_taken_kind: str = ""):
+        p = self._pending
+        assert p is not None, "finalize_room() called without a matching begin_room()"
+
+        post = telemetry.metrics_snapshot(player.metrics)
+        delta = telemetry.snapshot_delta(p["pre"], post)
+        died_in_room = 1 if room_result == "died" else 0
+        self.recent.push(delta)
+        if room_result != "died":
+            self.cleared_count += 1
+
+        loot_cols = telemetry.loot_bias_to_cols(p["applied_raw"].get("loot_bias"))
+        (cond_melee_ratio, cond_magic_ratio, cond_hpk_melee, cond_hpk_magic,
+         cond_dmg_ratio, cond_hp_ratio, cond_total_kills_norm,
+         cond_node_depth_norm, cond_progress_norm) = p["cond_vec"]
+
+        sample = telemetry.RoomSample(
+            run_id=self.run_id, room_seq=p["room_seq"], room_idx=p["room_idx"],
+            room_kind=p["room_kind"], node_depth=p["depth"],
+            progress_norm=p["progress_norm"], is_combat_room=p["is_combat"],
+
+            pre_melee_kills=p["pre"]["melee_kills"], pre_magic_kills=p["pre"]["magic_kills"],
+            pre_melee_hits=p["pre"]["melee_hits"], pre_magic_hits=p["pre"]["magic_hits"],
+            pre_damage_taken=p["pre"]["damage_taken"], pre_damage_dealt=p["pre"]["damage_dealt"],
+            pre_deaths=p["pre"]["deaths"], pre_time_alive=p["pre"]["time_alive"],
+            pre_hp_ratio=p["pre_hp_ratio"],
+
+            recent_melee_kills=p["recent_totals"]["melee_kills"],
+            recent_magic_kills=p["recent_totals"]["magic_kills"],
+            recent_melee_hits=p["recent_totals"]["melee_hits"],
+            recent_magic_hits=p["recent_totals"]["magic_hits"],
+            recent_damage_taken=p["recent_totals"]["damage_taken"],
+            recent_damage_dealt=p["recent_totals"]["damage_dealt"],
+            recent_n_rooms=p["recent_n"],
+
+            cond_melee_ratio=cond_melee_ratio, cond_magic_ratio=cond_magic_ratio,
+            cond_hpk_melee=cond_hpk_melee, cond_hpk_magic=cond_hpk_magic,
+            cond_dmg_ratio=cond_dmg_ratio, cond_hp_ratio=cond_hp_ratio,
+            cond_total_kills_norm=cond_total_kills_norm,
+            cond_node_depth_norm=cond_node_depth_norm,
+            cond_progress_norm=cond_progress_norm,
+
+            applied_raw_hp_mult=p["applied_raw"]["enemy_hp_mult"],
+            applied_raw_dmg_mult=p["applied_raw"]["enemy_dmg_mult"],
+            applied_raw_speed_mult=p["applied_raw"]["enemy_speed_mult"],
+            applied_raw_spawn_count=p["applied_raw"]["spawn_count"],
+
+            applied_hp_mult=p["applied"]["enemy_hp_mult"],
+            applied_dmg_mult=p["applied"]["enemy_dmg_mult"],
+            applied_speed_mult=p["applied"]["enemy_speed_mult"],
+            applied_spawn_count=p["applied"]["spawn_count"],
+            applied_loot_bias_weapon=loot_cols["weapon"],
+            applied_loot_bias_spell=loot_cols["spell"],
+            applied_loot_bias_armor=loot_cols["armor"],
+            applied_loot_bias_boots=loot_cols["boots"],
+
+            room_result=room_result, died_in_room=died_in_room,
+            melee_kills_in_room=delta["melee_kills"], magic_kills_in_room=delta["magic_kills"],
+            melee_hits_in_room=delta["melee_hits"], magic_hits_in_room=delta["magic_hits"],
+            damage_taken_in_room=delta["damage_taken"], damage_dealt_in_room=delta["damage_dealt"],
+            time_in_room=post["time_alive"] - p["pre"]["time_alive"],
+            loot_taken_kind=loot_taken_kind,
+        )
+        self.writer.write(sample)
+        self._pending = None
+        return sample
+
+
+HUMAN_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_sessions")
+
+
+def new_human_telemetry_session(node_map: NodeMap) -> Tuple["RoomTelemetrySession", "telemetry.ShardWriter", str]:
+    os.makedirs(HUMAN_LOG_DIR, exist_ok=True)
+    run_id = uuid.uuid4().hex
+    shard_path = os.path.join(HUMAN_LOG_DIR, f"human_{run_id}.csv")
+    writer = telemetry.open_shard_writer(shard_path)
+    session = RoomTelemetrySession(writer, node_map, run_id)
+    return session, writer, shard_path
+
+
+def close_human_telemetry_session(session: "RoomTelemetrySession", writer: "telemetry.ShardWriter",
+                                   shard_path: str, player: Optional[Player] = None):
+    """Flushes any still-pending sample (e.g. the process was quit mid-room)
+    as an honest 'skipped' record rather than losing or duplicating it, then
+    closes the shard and writes its manifest."""
+    if session.pending and player is not None:
+        session.finalize_room(player, "skipped")
+    n_written = writer.close()
+    manifest_path = shard_path[:-4] + ".manifest.json"
+    telemetry.write_manifest(
+        manifest_path, n_rows=n_written, seed_range=[0, 0],
+        extra={"source": "human", "player_run_id": session.run_id},
+    )
+    return n_written
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +673,7 @@ def entry_position(arena: pygame.Rect, came_from_dir: str) -> Tuple[float, float
     return cx, cy
 
 
-def main():
+def main(max_frames: Optional[int] = None):
     pygame.init()
     screen = pygame.display.set_mode((W, H))
     pygame.display.set_caption("Roguelike DDA Prototype")
@@ -562,7 +688,10 @@ def main():
     node_depths = compute_node_depth(node_map, node_map.start)
 
     player = Player(*arena.center)
-    applied = rule_based_dda(player.metrics, node_depth=0)
+    applied = rule_based_dda(player.metrics, node_depth=0, hp_ratio=1.0)
+
+    session, writer, shard_path = new_human_telemetry_session(node_map)
+    last_loot_kind = ""
 
     projectiles: List[Projectile] = []
     enemies: List[Enemy] = []
@@ -579,60 +708,62 @@ def main():
         forces a state change to a menu — the player keeps full movement
         control. Combat rooms simply start with their doors locked (see
         doors_unlocked in the main loop) until every enemy is dead.
+
+        Telemetry (finding #8): a RoomSample is only opened (begin_room())
+        the FIRST time a room is entered -- node.cleared is False. Revisiting
+        an already-cleared room while backtracking neither respawns enemies
+        nor opens a new pending sample.
         """
-        nonlocal enemies, projectiles, applied
+        nonlocal enemies, projectiles, applied, last_loot_kind
         projectiles = []
         enemies = []
+        last_loot_kind = ""
 
         node = node_map.nodes[idx]
-        depth = node_depths[idx]
-        applied = apply_model_tuning_if_available(player, node_depth=depth)
 
-        # Refill ammo on every room entry so magic is never permanently exhausted.
+        if node.cleared:
+            # Backtracking into a cleared room: no new sample, no respawn.
+            return
+
+        applied = session.begin_room(idx, player)
+
+        # Refill ammo on every (first) room entry so magic is never
+        # permanently exhausted.
         player.magic_ammo = player.spell.ammo_max
 
         if node.kind in ("nothing", "loot"):
-            node.cleared = True
+            # Finalized when the player actually leaves (see exit_dir
+            # handling below) so a loot pick made in this room is captured.
             return
 
-        # "enemy" / "boss" — if we're backtracking into an already-cleared
-        # combat room, don't respawn a fresh wave.
-        if node.cleared:
-            return
-
+        # "enemy" / "boss" -- applied already has boss multipliers folded
+        # in via effective_applied_config() inside session.begin_room(), so
+        # no separate boss branch is needed here (finding #5 fix).
         n = applied["spawn_count"]
-        if node.kind == "boss":
-            n = 1
-
         hp_base = ENEMY_BASE_HP * applied["enemy_hp_mult"]
         dmg_base = ENEMY_BASE_DMG * applied["enemy_dmg_mult"]
         spd_base = ENEMY_SPEED * applied["enemy_speed_mult"]
 
         for _ in range(n):
+            ex, ey = player.x, player.y
             for _attempt in range(50):
                 ex = random.randint(arena.left + 80, arena.right - 80)
                 ey = random.randint(arena.top + 80, arena.bottom - 80)
                 if vec_len(ex - player.x, ey - player.y) >= ENEMY_SPAWN_MIN_DIST:
                     break
-
-            hp, dmg, spd = hp_base, dmg_base, spd_base
-            if node.kind == "boss":
-                hp *= 4.0
-                dmg *= 1.7
-                spd *= 0.9
-            enemies.append(Enemy(ex, ey, hp=hp, dmg=dmg, speed=spd, aggro_r=ENEMY_AGGRO_R))
+            enemies.append(Enemy(ex, ey, hp=hp_base, dmg=dmg_base, speed=spd_base, aggro_r=ENEMY_AGGRO_R))
 
     def start_new_run():
         nonlocal node_map, current_node_idx, node_depths, player, state
+        nonlocal session, writer, shard_path
+        close_human_telemetry_session(session, writer, shard_path, player)
         node_map = generate_node_map_graph(16, seed=None)
         current_node_idx = node_map.start
         node_depths = compute_node_depth(node_map, node_map.start)
         player = Player(*arena.center)
+        session, writer, shard_path = new_human_telemetry_session(node_map)
         state = "arena"
         spawn_room(current_node_idx)
-
-    run_id = f"run_{random.randint(10000, 99999)}"
-    ensure_log_header()
 
     state = "arena"     # "arena" | "loot_ui" | "dead" | "win"
     spawn_room(current_node_idx)
@@ -670,9 +801,9 @@ def main():
         screen.blit(surf, (W / 2 - surf.get_width() / 2, H / 2 - surf.get_height() / 2))
 
     def door_state():
-        """Returns (doors: {dir: neighbor_idx}, locked: bool) for the current room."""
+        """Returns (doors: [dir, ...], locked: bool) for the current room."""
         node = current_node()
-        doors = node_map.doors(current_node_idx)
+        doors = node_map.doors(current_node_idx)  # list of direction strings
         enemies_alive = any(e.alive for e in enemies)
         locked = node.kind in ("enemy", "boss") and enemies_alive and not node.cleared
         return doors, locked
@@ -707,8 +838,8 @@ def main():
         pygame.draw.rect(screen, (26, 26, 34), box, border_radius=6)
         pygame.draw.rect(screen, (70, 70, 86), box, 1, border_radius=6)
 
-        cols = [nd.col for nd in node_map.nodes]
-        rows = [nd.row for nd in node_map.nodes]
+        cols = [nd.col for nd in node_map.nodes.values()]
+        rows = [nd.row for nd in node_map.nodes.values()]
         cmin, cmax = min(cols), max(cols)
         rmin, rmax = min(rows), max(rows)
         cspan = max(1, cmax - cmin)
@@ -721,13 +852,13 @@ def main():
             return px, py
 
         for a, nbrs in node_map.edges.items():
-            for b in nbrs:
+            for b in nbrs.values():
                 if a < b:
                     pygame.draw.line(screen, (90, 90, 100), pt(node_map.nodes[a]), pt(node_map.nodes[b]), 1)
 
         kind_color = {"nothing": (170, 170, 170), "enemy": (170, 90, 90),
                       "loot": (90, 190, 190), "boss": (220, 60, 60)}
-        for i, nd in enumerate(node_map.nodes):
+        for i, nd in node_map.nodes.items():
             px, py = pt(nd)
             col = kind_color.get(nd.kind, (170, 170, 170))
             if nd.cleared:
@@ -738,7 +869,9 @@ def main():
                 pygame.draw.circle(screen, (255, 255, 255), (int(px), int(py)), r + 2, 1)
 
     running = True
-    while running:
+    frame = 0
+    while running and (max_frames is None or frame < max_frames):
+        frame += 1
         dt = clock.tick(FPS) / 1000.0
 
         for ev in pygame.event.get():
@@ -769,14 +902,13 @@ def main():
                     if ev.key in (pygame.K_LEFT, pygame.K_a) and loot_options:
                         loot_choice_idx = (loot_choice_idx - 1) % len(loot_options)
                     if ev.key == pygame.K_RETURN and loot_options:
-                        apply_loot_choice(player, loot_options[loot_choice_idx])
+                        kind, item = loot_options[loot_choice_idx]
+                        apply_loot_choice(player, (kind, item))
                         current_node().looted = True
+                        last_loot_kind = kind
                         state = "arena"
 
                 elif ev.key == pygame.K_RETURN and state in ("dead", "win"):
-                    # NOTE: append_run() already fired once, at the moment the
-                    # state transitioned to "dead"/"win" below. Do not log again here.
-                    run_id = f"run_{random.randint(10000, 99999)}"
                     start_new_run()
 
             if ev.type == pygame.MOUSEBUTTONDOWN and state == "arena":
@@ -797,7 +929,7 @@ def main():
         # ---------------------------------------------------------------
         if state == "arena":
             doors, locked = door_state()
-            doors_unlocked = set() if locked else set(doors.keys())
+            doors_unlocked = set() if locked else set(doors)
 
             player.update(dt, keys, arena, doors_unlocked=doors_unlocked)
 
@@ -837,18 +969,25 @@ def main():
 
             if not player.alive:
                 state = "dead"
-                append_run(run_id, player, applied)   # single log site (see append_run docstring)
+                if session.pending:
+                    session.finalize_room(player, "died")
 
             elif node.kind in ("enemy", "boss") and not enemies_alive and not node.cleared:
                 node.cleared = True
+                if session.pending:
+                    session.finalize_room(player, "cleared")
                 if node.kind == "boss":
                     state = "win"
-                    append_run(run_id, player, applied)  # single log site
 
             elif player.exit_dir is not None:
                 direction = player.exit_dir
-                next_idx = doors.get(direction)
+                next_idx = node_map.neighbors(current_node_idx).get(direction)
                 if next_idx is not None:
+                    if session.pending:
+                        # Non-combat room (nothing/loot) being left for the
+                        # first time -- finalize now, capturing whatever
+                        # loot was (or wasn't) taken.
+                        session.finalize_room(player, "cleared", loot_taken_kind=last_loot_kind)
                     node.cleared = True
                     current_node_idx = next_idx
                     spawn_room(current_node_idx)
@@ -905,7 +1044,9 @@ def main():
 
         pygame.display.flip()
 
+    n_written = close_human_telemetry_session(session, writer, shard_path, player)
     pygame.quit()
+    return shard_path, n_written
 
 
 if __name__ == "__main__":

@@ -1,38 +1,26 @@
 """
 node_map_gen.py
 ================
-Generates the dungeon layout as a sparse, tree-shaped graph of rooms placed
-on an actual grid, so that:
+Darkest-Dungeon-style branching dungeon graph generator.
 
-  * every room's neighbours are physically N/S/E/W of it (a real floor plan,
-    not an abstract node graph) — this is what lets rogue.py let the player
-    walk between rooms instead of clicking a map.
-  * the layout is a spanning tree (grown with a randomized Prim's-style walk),
-    so there is never more than one route between any two rooms — this is
-    deliberately NOT a fully-connected mesh. Every room you can reach, you
-    reach by a single, specific path of doors.
-  * the boss room is placed at the room with the greatest tree-distance from
-    the start, so a path from start to boss is guaranteed to exist by
-    construction (it's the literal path used to compute that distance).
-  * only four room kinds exist: "nothing" (incl. the start room), "enemy",
-    "loot", "boss". No elites, no shops — kept deliberately simple.
+Guarantees:
+  * every node is reachable from `start`
+  * `boss` is reachable from every leaf (there is always a path to the boss)
+  * the graph is NOT a fully-connected mesh (it's a spanning tree over a
+    grid, plus a small number of extra "loop" edges between grid-adjacent
+    nodes already in the tree)
+  * exactly 4 room kinds: "enemy", "boss", "loot", "nothing"
 
-Rooms are still allowed a *few* extra doors beyond the spanning tree (see
-`extra_loops`) purely to avoid every dungeon being a single strict corridor
-with no interesting branching-and-rejoining, but the default is small and
-this never turns the layout into a mesh.
+Unchanged from the Phase 2a redesign — no finding in the review targets
+this file directly.
 """
 
-import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 import random
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
 
-# Cardinal directions and their opposites / (dcol, drow) deltas.
 OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
 DELTA = {"N": (0, -1), "S": (0, 1), "E": (1, 0), "W": (-1, 0)}
-
-ROOM_KINDS = ("nothing", "enemy", "loot", "boss")
 
 
 @dataclass
@@ -40,68 +28,54 @@ class MapNode:
     idx: int
     col: int
     row: int
-    kind: str = "nothing"
+    kind: str = "nothing"          # enemy | boss | loot | nothing
     cleared: bool = False
-    looted: bool = False   # has the loot pedestal in this room already been used?
+    looted: bool = False
 
 
 class NodeMap:
-    def __init__(self, nodes: List[MapNode], edges: Dict[int, Set[int]], start: int, boss: int):
-        self.nodes = nodes
-        self.edges = edges
-        self.start = start
-        self.boss = boss
+    def __init__(self):
+        self.nodes: Dict[int, MapNode] = {}
+        self.edges: Dict[int, Dict[str, int]] = {}   # idx -> {dir: idx}
+        self.start: Optional[int] = None
+        self.boss: Optional[int] = None
 
-    def neighbors(self, i: int) -> List[int]:
-        return list(self.edges.get(i, set()))
+    def neighbors(self, idx: int) -> Dict[str, int]:
+        return self.edges.get(idx, {})
 
     def direction(self, a: int, b: int) -> Optional[str]:
-        """Cardinal direction to walk from room `a` to reach room `b`.
-        Returns None if the rooms aren't grid-adjacent (shouldn't happen for
-        connected edges, since we only ever add edges between adjacent cells)."""
-        na, nb = self.nodes[a], self.nodes[b]
-        dc, dr = nb.col - na.col, nb.row - na.row
-        for d, (ddc, ddr) in DELTA.items():
-            if (ddc, ddr) == (dc, dr):
+        for d, nb in self.edges.get(a, {}).items():
+            if nb == b:
                 return d
         return None
 
-    def doors(self, i: int) -> Dict[str, int]:
-        """{direction: neighbor_idx} for every connected neighbor of room i."""
-        out = {}
-        for j in self.neighbors(i):
-            d = self.direction(i, j)
-            if d is not None:
-                out[d] = j
-        return out
+    def doors(self, idx: int) -> List[str]:
+        return list(self.edges.get(idx, {}).keys())
+
+    def _add_edge(self, a: int, b: int, d: str):
+        self.edges.setdefault(a, {})
+        self.edges.setdefault(b, {})
+        self.edges[a][d] = b
+        self.edges[b][OPPOSITE[d]] = a
 
 
-def _bfs_depths(node_count: int, edges: Dict[int, Set[int]], start: int) -> List[int]:
-    from collections import deque
-    depth = [-1] * node_count
-    depth[start] = 0
-    q = deque([start])
-    while q:
-        u = q.popleft()
-        for v in edges.get(u, set()):
-            if depth[v] == -1:
-                depth[v] = depth[u] + 1
-                q.append(v)
-    return depth
+def _bfs_depths(node_map: NodeMap, start: int) -> Dict[int, int]:
+    depths = {start: 0}
+    queue = [start]
+    head = 0
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        for _, nb in node_map.edges.get(cur, {}).items():
+            if nb not in depths:
+                depths[nb] = depths[cur] + 1
+                queue.append(nb)
+    return depths
 
 
-def _add_edge(edges: Dict[int, Set[int]], a: int, b: int):
-    edges.setdefault(a, set()).add(b)
-    edges.setdefault(b, set()).add(a)
-
-
-def compute_node_depth(node_map: NodeMap, start: int) -> List[int]:
-    """BFS from start; returns depth[i] for every node i.
-
-    Single shared implementation — previously duplicated near-identically in
-    both rogue.py and bot_runner.py.
-    """
-    return _bfs_depths(len(node_map.nodes), node_map.edges, start)
+def compute_node_depth(node_map: NodeMap, start: Optional[int] = None) -> Dict[int, int]:
+    s = start if start is not None else node_map.start
+    return _bfs_depths(node_map, s)
 
 
 def generate_node_map_graph(
@@ -114,119 +88,100 @@ def generate_node_map_graph(
     seed: Optional[int] = None,
 ) -> NodeMap:
     """
-    Grow a branching, tree-shaped dungeon on a `cols` x `rows` grid.
-
-    Algorithm (randomized Prim's-style growth — produces a spanning tree by
-    construction, i.e. never a fully-connected mesh):
-      1. Start from a random cell; mark it visited.
-      2. Maintain a frontier of (visited_cell -> unvisited_adjacent_cell) pairs.
-      3. Repeatedly pick a random frontier pair, carve a door between them,
-         mark the new cell visited, and add its own unvisited neighbours to
-         the frontier. Stop once `node_count` cells are visited (or the grid
-         is exhausted).
-      4. Optionally add a handful of `extra_loops` extra doors between
-         already-adjacent visited cells that aren't yet connected, purely for
-         minor branch variety. Kept small on purpose.
-      5. The start room is the first cell visited. The boss room is whichever
-         visited cell has the greatest tree-distance (BFS depth) from start —
-         guaranteeing a path from start to boss exists.
-      6. Remaining rooms are randomly assigned "enemy" / "loot" / "nothing"
-         by weight.
+    Randomized-Prim's-style spanning-tree growth on a `cols` x `rows` grid.
+    Picks `node_count` distinct grid cells, grows a tree from a random start
+    cell by repeatedly adding a random frontier cell (grid-adjacent to an
+    already-placed cell), then adds a small number of extra edges between
+    grid-adjacent placed cells that aren't already connected (creates
+    alternate routes without ever becoming a full mesh). The boss is the
+    node with maximum BFS depth from start.
     """
     rng = random.Random(seed)
+    node_count = min(node_count, cols * rows)
 
-    if node_count > cols * rows:
-        # Grow the grid just enough to fit the requested room count.
-        side = int(math.ceil(math.sqrt(node_count)))
-        cols = rows = side
+    all_cells = [(c, r) for c in range(cols) for r in range(rows)]
+    rng.shuffle(all_cells)
 
-    def cell_id(c, r):
-        return r * cols + c
+    start_cell = all_cells[0]
+    placed_cells = {start_cell}
+    frontier: List[Tuple[Tuple[int, int], Tuple[int, int], str]] = []
 
-    def in_bounds(c, r):
-        return 0 <= c < cols and 0 <= r < rows
-
-    start_c, start_r = rng.randrange(cols), rng.randrange(rows)
-    start_cell = cell_id(start_c, start_r)
-    visited: Set[int] = {start_cell}
-    coord_of: Dict[int, Tuple[int, int]] = {start_cell: (start_c, start_r)}
-    edges: Dict[int, Set[int]] = {}
-
-    # Frontier: list of (visited_cell_id, unvisited_cell_id) candidate doors.
-    frontier: List[Tuple[int, int]] = []
-
-    def push_frontier(cid, c, r):
+    def push_frontier(cell):
+        c, r = cell
         for d, (dc, dr) in DELTA.items():
             nc, nr = c + dc, r + dr
-            if in_bounds(nc, nr):
-                nid = cell_id(nc, nr)
-                if nid not in visited:
-                    frontier.append((cid, nid))
+            if 0 <= nc < cols and 0 <= nr < rows and (nc, nr) not in placed_cells:
+                frontier.append((cell, (nc, nr), d))
 
-    push_frontier(start_cell, start_c, start_r)
+    push_frontier(start_cell)
 
-    while len(visited) < node_count and frontier:
-        pick = rng.randrange(len(frontier))
-        a_id, b_id = frontier.pop(pick)
-        if b_id in visited:
-            continue  # became visited via another frontier edge meanwhile
-        bc, br = b_id % cols, b_id // cols
-        visited.add(b_id)
-        coord_of[b_id] = (bc, br)
-        _add_edge(edges, a_id, b_id)
-        push_frontier(b_id, bc, br)
+    cell_to_idx: Dict[Tuple[int, int], int] = {start_cell: 0}
+    node_map = NodeMap()
+    node_map.nodes[0] = MapNode(idx=0, col=start_cell[0], row=start_cell[1])
+    next_idx = 1
 
-    # Re-index visited cells 0..N-1 in a stable order (grid scan order) so
-    # MapNode indices are compact regardless of grid size.
-    ordered_cell_ids = sorted(visited)
-    remap = {cell_id_: i for i, cell_id_ in enumerate(ordered_cell_ids)}
+    tree_edges: List[Tuple[Tuple[int, int], Tuple[int, int], str]] = []
 
-    nodes: List[MapNode] = []
-    for cell_id_ in ordered_cell_ids:
-        c, r = coord_of[cell_id_]
-        nodes.append(MapNode(idx=remap[cell_id_], col=c, row=r))
+    while len(placed_cells) < node_count and frontier:
+        rng.shuffle(frontier)
+        a, b, d = frontier.pop()
+        if b in placed_cells:
+            continue
+        placed_cells.add(b)
+        cell_to_idx[b] = next_idx
+        node_map.nodes[next_idx] = MapNode(idx=next_idx, col=b[0], row=b[1])
+        next_idx += 1
+        tree_edges.append((a, b, d))
+        push_frontier(b)
 
-    remapped_edges: Dict[int, Set[int]] = {}
-    for a_id, nbrs in edges.items():
-        for b_id in nbrs:
-            _add_edge(remapped_edges, remap[a_id], remap[b_id])
+    for a, b, d in tree_edges:
+        node_map._add_edge(cell_to_idx[a], cell_to_idx[b], d)
 
-    start_idx = remap[start_cell]
-
-    # A handful of extra doors between grid-adjacent visited rooms that
-    # aren't already connected — kept small so it never becomes a mesh.
-    n = len(nodes)
-    coord_to_idx = {(nd.col, nd.row): nd.idx for nd in nodes}
+    # A few extra loop edges between grid-adjacent already-placed cells that
+    # aren't yet connected. Kept small (`extra_loops`) so this never becomes
+    # a full mesh -- most rooms should still have exactly 1-2 exits.
+    placed_list = list(placed_cells)
+    candidate_pairs = []
+    for cell in placed_list:
+        c, r = cell
+        for d, (dc, dr) in DELTA.items():
+            nb = (c + dc, r + dr)
+            if nb in placed_cells:
+                a_idx, b_idx = cell_to_idx[cell], cell_to_idx[nb]
+                if node_map.direction(a_idx, b_idx) is None:
+                    candidate_pairs.append((cell, nb, d))
+    rng.shuffle(candidate_pairs)
     added = 0
-    tries = 0
-    while added < extra_loops and tries < 200:
-        tries += 1
-        i = rng.randrange(n)
-        ni = nodes[i]
-        d = rng.choice(list(DELTA.keys()))
-        dc, dr = DELTA[d]
-        j = coord_to_idx.get((ni.col + dc, ni.row + dr))
-        if j is None or j == i:
+    seen_pairs = set()
+    for a, b, d in candidate_pairs:
+        if added >= extra_loops:
+            break
+        a_idx, b_idx = cell_to_idx[a], cell_to_idx[b]
+        key = tuple(sorted((a_idx, b_idx)))
+        if key in seen_pairs:
             continue
-        if j in remapped_edges.get(i, set()):
-            continue
-        _add_edge(remapped_edges, i, j)
-        added += 1
+        if node_map.direction(a_idx, b_idx) is None:
+            node_map._add_edge(a_idx, b_idx, d)
+            seen_pairs.add(key)
+            added += 1
 
-    # Boss = farthest room from start by tree distance -> guarantees a path.
-    depths = _bfs_depths(n, remapped_edges, start_idx)
-    boss_idx = max(range(n), key=lambda i: depths[i])
+    node_map.start = cell_to_idx[start_cell]
+    depths = _bfs_depths(node_map, node_map.start)
+    boss_idx = max(depths.items(), key=lambda kv: kv[1])[0]
+    node_map.boss = boss_idx
 
-    nodes[start_idx].kind = "nothing"
-    nodes[boss_idx].kind = "boss"
+    for idx, node in node_map.nodes.items():
+        if idx == node_map.start:
+            node.kind = "nothing"
+        elif idx == boss_idx:
+            node.kind = "boss"
+        else:
+            roll = rng.random()
+            if roll < enemy_weight:
+                node.kind = "enemy"
+            elif roll < enemy_weight + loot_weight:
+                node.kind = "loot"
+            else:
+                node.kind = "nothing"
 
-    # Assign remaining kinds by weight.
-    nothing_weight = max(0.0, 1.0 - enemy_weight - loot_weight)
-    kinds = ["enemy", "loot", "nothing"]
-    weights = [enemy_weight, loot_weight, nothing_weight]
-    for nd in nodes:
-        if nd.idx in (start_idx, boss_idx):
-            continue
-        nd.kind = rng.choices(kinds, weights=weights, k=1)[0]
-
-    return NodeMap(nodes, remapped_edges, start_idx, boss_idx)
+    return node_map
