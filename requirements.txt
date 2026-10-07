@@ -1,0 +1,37 @@
+# Adaptive Difficulty Rogue — dependencies for the ACTIVE pipeline:
+#   dda_core.py, telemetry.py, controllers.py, balance.py, bot_runner.py,
+#   models.py, train_q.py, train_cgan.py, model_runtime.py,
+#   evaluate_controllers.py, analyze_results.py, dataset_tools.py, rogue.py
+# The data-generation path (bot_runner.py with fixed/heuristic/exploration
+# controllers, telemetry.py, dda_core.py, node_map_gen.py, balance.py,
+# controllers.py) uses only the Python standard library.
+#
+# Verified with Python 3.12.3 (Linux/WSL2). See README.md for the smoke checks.
+#
+# Install:  python -m pip install -r requirements.txt
+# The default PyPI torch wheel on Linux is a CUDA build. For a CPU-only
+# install (smaller download), install torch first from the CPU index:
+#   python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+
+# Game client (rogue.py)
+pygame==2.6.1
+
+# Q / cGAN training and runtime inference (models.py, train_q.py,
+# train_cgan.py, model_runtime.py, controllers.CGANController)
+torch==2.14.1
+
+# Not imported directly; keeps PyTorch's NumPy interop available and silences
+# "Failed to initialize NumPy" warnings.
+numpy==2.5.3
+
+# Thesis plots (analyze_results.py --plots). Optional: analysis falls back to
+# CSV/JSON/Markdown tables without it.
+matplotlib==3.11.2
+
+# Test suite (pytest -q)
+pytest==9.1.1
+
+# NOT included (legacy / exploratory only — do not use for the final experiment):
+#   cGAN.py, dummy.py, DATA_AUGMENTATION/   -> pandas
+#   cgan_training_phased.ipynb              -> pandas, matplotlib, scikit-learn
+# Install those manually only if you must reopen the legacy material.

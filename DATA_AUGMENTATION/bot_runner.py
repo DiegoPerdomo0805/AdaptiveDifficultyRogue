@@ -1,3 +1,18 @@
+# --- DEPRECATED (cGAN_vs_heuristic) ------------------------------------------
+# Legacy bot that writes the old run-level runs.csv schema.
+# It is NOT part of the final experiment. The authoritative pipeline is the
+# root bot_runner.py -> train_q.py -> train_cgan.py -> evaluate_controllers.py
+# (see README.md). Set ROGUE_ALLOW_LEGACY=1 only to reopen historical material.
+import os as _os
+import sys as _sys
+if __name__ == "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    _sys.exit("DATA_AUGMENTATION/bot_runner.py is DEPRECATED legacy code (old runs.csv schema, not the RoomSample contract). Use the root pipeline "
+              "described in README.md. Set ROGUE_ALLOW_LEGACY=1 to override.")
+if __name__ != "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    raise ImportError("DATA_AUGMENTATION/bot_runner.py is DEPRECATED legacy code and must not be imported "
+                      "by the active pipeline. Set ROGUE_ALLOW_LEGACY=1 to override.")
+# ---------------------------------------------------------------------------
+
 """
 bot_runner.py
 =============

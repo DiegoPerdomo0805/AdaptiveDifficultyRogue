@@ -1,3 +1,42 @@
+.venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ML artifacts
+*.pt
+*.pth
+*.ckpt
+model_out/
+model_out*/
+q_out/
+q_out*/
+
+# Local experiment/output data
+runs/
+checkpoints/
+experiments/
+smoke/
+*.shards/
+*.csv.tmp
+plots/
+*.png
+*.log
+
+# Bulk generated datasets (noncanonical). Human sessions and the legacy
+# runs.csv are tracked explicitly and are not affected by these patterns.
+room_samples*.csv
+room_samples*.manifest.json
+eval_*.csv
+eval_*.manifest.json
+
+# ignore (private notes / assignment prompts)
+*.md
+# ...but project documentation must be tracked
+!README.md
+!**/README.md

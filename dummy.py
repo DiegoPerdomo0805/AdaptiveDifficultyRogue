@@ -1,3 +1,18 @@
+# --- DEPRECATED (cGAN_vs_heuristic) ------------------------------------------
+# Exploratory CUDA/pandas scratch script.
+# It is NOT part of the final experiment. The authoritative pipeline is the
+# root bot_runner.py -> train_q.py -> train_cgan.py -> evaluate_controllers.py
+# (see README.md). Set ROGUE_ALLOW_LEGACY=1 only to reopen historical material.
+import os as _os
+import sys as _sys
+if __name__ == "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    _sys.exit("dummy.py is DEPRECATED legacy code (exploratory scratch). Use the root pipeline "
+              "described in README.md. Set ROGUE_ALLOW_LEGACY=1 to override.")
+if __name__ != "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    raise ImportError("dummy.py is DEPRECATED legacy code and must not be imported "
+                      "by the active pipeline. Set ROGUE_ALLOW_LEGACY=1 to override.")
+# ---------------------------------------------------------------------------
+
 import math
 import random
 from typing import Dict, List, Optional, Set
