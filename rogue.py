@@ -67,51 +67,26 @@ def angle_diff_deg(a, b):
 
 
 # ---------------------------------------------------------------------------
-# Model loading -- isolated from cwd via spec_from_file_location, matching
-# EXACTLY the API model_runtime.LoadedModels actually exposes
-# (predict(cond_vec) -> dict), not an older "generate(features)" shape that
-# never matched what model_runtime.py implements.
+# DDA controller selection. ROGUE_CONTROLLER=fixed|heuristic|cgan (default
+# heuristic). ROGUE_ENABLE_MODEL=1 is kept as an alias for cgan. The cGAN
+# controller loads model_runtime.py by path (cwd-independent) and falls back
+# to the heuristic on any incompatibility/invalid output -- every fallback
+# and its reason are written to the room telemetry (fallback_used/_reason).
 # ---------------------------------------------------------------------------
 
-_model_runtime = None
-_loaded_models = None
-_model_load_failed = False
+CONTROLLER_NAME = os.environ.get("ROGUE_CONTROLLER", "cgan" if ENABLE_MODEL else "heuristic")
 
 
-def apply_model_tuning_if_available(cond_vec: List[float], fallback: dict) -> dict:
-    """
-    Returns a rule_based_dda()-shaped dict (enemy_hp_mult/enemy_dmg_mult/
-    enemy_speed_mult/spawn_count/loot_bias), either from the trained model
-    (if ENABLE_MODEL and it loads/validates successfully) or `fallback`
-    (the heuristic's own output). Any failure to load, a version mismatch,
-    or a runtime error falls back SAFELY to the heuristic instead of
-    crashing the game -- and is only attempted once per process (a broken
-    model doesn't retry every single room).
-    """
-    global _model_runtime, _loaded_models, _model_load_failed
-    if not ENABLE_MODEL or _model_load_failed:
-        return fallback
-    try:
-        if _model_runtime is None:
-            import importlib.util
-            this_dir = os.path.dirname(os.path.abspath(__file__))
-            spec = importlib.util.spec_from_file_location(
-                "model_runtime", os.path.join(this_dir, "model_runtime.py"))
-            if spec is None or spec.loader is None:
-                raise ImportError("Could not load model_runtime.py")
-            _model_runtime = importlib.util.module_from_spec(spec)
-            sys.modules["model_runtime"] = _model_runtime
-            spec.loader.exec_module(_model_runtime)
-        if _loaded_models is None:
-            _loaded_models = _model_runtime.LoadedModels.load(MODEL_DIR)
-
-        pred = _loaded_models.predict(cond_vec)
-        pred["loot_bias"] = fallback.get("loot_bias", [0.25, 0.25, 0.25, 0.25])
-        return pred
-    except Exception as e:
-        print(f"[MODEL] Falling back to heuristic DDA: {e}", file=sys.stderr)
-        _model_load_failed = True
-        return fallback
+def make_game_controller(name: str = None):
+    import controllers
+    name = name or CONTROLLER_NAME
+    if name not in ("fixed", "heuristic", "cgan"):
+        raise ValueError(f"ROGUE_CONTROLLER must be fixed|heuristic|cgan, got {name!r}")
+    ctrl = controllers.make_controller(name, model_dir=MODEL_DIR)
+    if getattr(ctrl, "load_error", ""):
+        print(f"[MODEL] cGAN unavailable, every room falls back to the heuristic: "
+              f"{ctrl.load_error}", file=sys.stderr)
+    return ctrl
 
 
 ### ============= Entity Classes ======== ###
@@ -489,10 +464,17 @@ def apply_loot_choice(player: Player, choice: Tuple[str, object]):
 # ---------------------------------------------------------------------------
 
 class RoomTelemetrySession:
-    def __init__(self, writer: "telemetry.ShardWriter", node_map: NodeMap, run_id: str):
+    def __init__(self, writer: "telemetry.ShardWriter", node_map: NodeMap, run_id: str,
+                 run_seed: int = 0, controller=None):
+        import balance
+        import controllers
         self.writer = writer
         self.node_map = node_map
         self.run_id = run_id
+        self.run_seed = run_seed
+        self.controller = controller or controllers.make_controller("heuristic")
+        self.controller.begin_run(run_seed)
+        self.exp_version = balance.load_experiment_config()["experiment_config_version"]
         self.depths = compute_node_depth(node_map, node_map.start)
         self.total_rooms = len(node_map.nodes)
         self.recent = telemetry.RecentWindow()
@@ -517,28 +499,18 @@ class RoomTelemetrySession:
 
         pre = telemetry.metrics_snapshot(player.metrics)
         pre_hp_ratio = player.hp_ratio()
-        recent_totals = self.recent.totals()
-        recent_n = self.recent.n_rooms()
+        # Official condition contract, shared with bot_runner.py.
+        cond_vec, recent_totals, recent_n = telemetry.build_condition(
+            pre, self.recent, pre_hp_ratio, depth, progress_norm)
 
-        # Official condition contract (finding #3): behavioral components
-        # from the recent window; hp_ratio instantaneous; kills/depth/
-        # progress cumulative & contextual. Falls back to cumulative-so-far
-        # if the window is still empty (first room of the run).
-        if recent_n > 0:
-            mk, gk = recent_totals["melee_kills"], recent_totals["magic_kills"]
-            mh, gh = recent_totals["melee_hits"], recent_totals["magic_hits"]
-            dt_, dd_ = recent_totals["damage_taken"], recent_totals["damage_dealt"]
-        else:
-            mk, gk = pre["melee_kills"], pre["magic_kills"]
-            mh, gh = pre["melee_hits"], pre["magic_hits"]
-            dt_, dd_ = pre["damage_taken"], pre["damage_dealt"]
-
-        cond_vec = core.feature_vector_from_raw(
-            mk, gk, mh, gh, dt_, dd_, pre_hp_ratio, depth, progress_norm,
-        )
-
-        applied_raw = rule_based_dda(player.metrics, node_depth=depth, hp_ratio=pre_hp_ratio)
-        applied_raw = apply_model_tuning_if_available(cond_vec, applied_raw)
+        import controllers
+        decision = self.controller.decide(controllers.DecisionContext(
+            cond_vec=cond_vec, metrics=player.metrics, node_depth=depth,
+            hp_ratio=pre_hp_ratio, room_kind=node.kind))
+        if decision.fallback_used:
+            print(f"[MODEL] room {room_idx}: heuristic fallback ({decision.fallback_reason})",
+                  file=sys.stderr)
+        applied_raw = decision.action
         # Single choke point (finding #5): boss multipliers folded in HERE,
         # so what's returned to spawn_room() to build enemies IS what gets
         # logged -- they can never diverge again.
@@ -551,7 +523,7 @@ class RoomTelemetrySession:
             "pre": pre, "pre_hp_ratio": pre_hp_ratio,
             "recent_totals": recent_totals, "recent_n": recent_n,
             "cond_vec": cond_vec, "applied_raw": applied_raw, "applied": applied,
-            "room_seq": self.room_seq,
+            "room_seq": self.room_seq, "decision": decision,
         }
         return applied
 
@@ -566,57 +538,17 @@ class RoomTelemetrySession:
         if room_result != "died":
             self.cleared_count += 1
 
-        loot_cols = telemetry.loot_bias_to_cols(p["applied_raw"].get("loot_bias"))
-        (cond_melee_ratio, cond_magic_ratio, cond_hpk_melee, cond_hpk_magic,
-         cond_dmg_ratio, cond_hp_ratio, cond_total_kills_norm,
-         cond_node_depth_norm, cond_progress_norm) = p["cond_vec"]
-
-        sample = telemetry.RoomSample(
-            run_id=self.run_id, room_seq=p["room_seq"], room_idx=p["room_idx"],
-            room_kind=p["room_kind"], node_depth=p["depth"],
-            progress_norm=p["progress_norm"], is_combat_room=p["is_combat"],
-
-            pre_melee_kills=p["pre"]["melee_kills"], pre_magic_kills=p["pre"]["magic_kills"],
-            pre_melee_hits=p["pre"]["melee_hits"], pre_magic_hits=p["pre"]["magic_hits"],
-            pre_damage_taken=p["pre"]["damage_taken"], pre_damage_dealt=p["pre"]["damage_dealt"],
-            pre_deaths=p["pre"]["deaths"], pre_time_alive=p["pre"]["time_alive"],
-            pre_hp_ratio=p["pre_hp_ratio"],
-
-            recent_melee_kills=p["recent_totals"]["melee_kills"],
-            recent_magic_kills=p["recent_totals"]["magic_kills"],
-            recent_melee_hits=p["recent_totals"]["melee_hits"],
-            recent_magic_hits=p["recent_totals"]["magic_hits"],
-            recent_damage_taken=p["recent_totals"]["damage_taken"],
-            recent_damage_dealt=p["recent_totals"]["damage_dealt"],
-            recent_n_rooms=p["recent_n"],
-
-            cond_melee_ratio=cond_melee_ratio, cond_magic_ratio=cond_magic_ratio,
-            cond_hpk_melee=cond_hpk_melee, cond_hpk_magic=cond_hpk_magic,
-            cond_dmg_ratio=cond_dmg_ratio, cond_hp_ratio=cond_hp_ratio,
-            cond_total_kills_norm=cond_total_kills_norm,
-            cond_node_depth_norm=cond_node_depth_norm,
-            cond_progress_norm=cond_progress_norm,
-
-            applied_raw_hp_mult=p["applied_raw"]["enemy_hp_mult"],
-            applied_raw_dmg_mult=p["applied_raw"]["enemy_dmg_mult"],
-            applied_raw_speed_mult=p["applied_raw"]["enemy_speed_mult"],
-            applied_raw_spawn_count=p["applied_raw"]["spawn_count"],
-
-            applied_hp_mult=p["applied"]["enemy_hp_mult"],
-            applied_dmg_mult=p["applied"]["enemy_dmg_mult"],
-            applied_speed_mult=p["applied"]["enemy_speed_mult"],
-            applied_spawn_count=p["applied"]["spawn_count"],
-            applied_loot_bias_weapon=loot_cols["weapon"],
-            applied_loot_bias_spell=loot_cols["spell"],
-            applied_loot_bias_armor=loot_cols["armor"],
-            applied_loot_bias_boots=loot_cols["boots"],
-
-            room_result=room_result, died_in_room=died_in_room,
-            melee_kills_in_room=delta["melee_kills"], magic_kills_in_room=delta["magic_kills"],
-            melee_hits_in_room=delta["melee_hits"], magic_hits_in_room=delta["magic_hits"],
-            damage_taken_in_room=delta["damage_taken"], damage_dealt_in_room=delta["damage_dealt"],
+        sample = telemetry.build_room_sample(
+            run_id=self.run_id, run_seed=self.run_seed, player_profile="human",
+            room_seq=p["room_seq"], room_idx=p["room_idx"], room_kind=p["room_kind"],
+            node_depth=p["depth"], progress_norm=p["progress_norm"],
+            pre=p["pre"], pre_hp_ratio=p["pre_hp_ratio"],
+            recent_totals=p["recent_totals"], recent_n=p["recent_n"], cond_vec=p["cond_vec"],
+            controller_meta=p["decision"].meta(), applied_raw=p["applied_raw"],
+            applied=p["applied"], room_result=room_result, delta=delta,
             time_in_room=post["time_alive"] - p["pre"]["time_alive"],
-            loot_taken_kind=loot_taken_kind,
+            post_hp_ratio=player.hp_ratio(), loot_taken_kind=loot_taken_kind,
+            experiment_config_version=self.exp_version,
         )
         self.writer.write(sample)
         self._pending = None
@@ -626,12 +558,16 @@ class RoomTelemetrySession:
 HUMAN_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_sessions")
 
 
-def new_human_telemetry_session(node_map: NodeMap) -> Tuple["RoomTelemetrySession", "telemetry.ShardWriter", str]:
-    os.makedirs(HUMAN_LOG_DIR, exist_ok=True)
+def new_human_telemetry_session(node_map: NodeMap, run_seed: int = 0, controller=None,
+                                log_dir: Optional[str] = None,
+                                ) -> Tuple["RoomTelemetrySession", "telemetry.ShardWriter", str]:
+    log_dir = log_dir or HUMAN_LOG_DIR
+    os.makedirs(log_dir, exist_ok=True)
     run_id = uuid.uuid4().hex
-    shard_path = os.path.join(HUMAN_LOG_DIR, f"human_{run_id}.csv")
+    shard_path = os.path.join(log_dir, f"human_{run_id}.csv")
     writer = telemetry.open_shard_writer(shard_path)
-    session = RoomTelemetrySession(writer, node_map, run_id)
+    session = RoomTelemetrySession(writer, node_map, run_id, run_seed=run_seed,
+                                   controller=controller)
     return session, writer, shard_path
 
 
@@ -645,8 +581,9 @@ def close_human_telemetry_session(session: "RoomTelemetrySession", writer: "tele
     n_written = writer.close()
     manifest_path = shard_path[:-4] + ".manifest.json"
     telemetry.write_manifest(
-        manifest_path, n_rows=n_written, seed_range=[0, 0],
+        manifest_path, n_rows=n_written, seed_range=[session.run_seed, session.run_seed],
         extra={"source": "human", "player_run_id": session.run_id},
+        controller_counts={session.controller.controller_type: 1},
     )
     return n_written
 
@@ -683,14 +620,16 @@ def main(max_frames: Optional[int] = None):
 
     arena = pygame.Rect(ARENA_MARGIN, ARENA_MARGIN, W - 2 * ARENA_MARGIN, H - 2 * ARENA_MARGIN)
 
-    node_map = generate_node_map_graph(16, seed=None)
+    controller = make_game_controller()
+    run_seed = random.randrange(2**31)
+    node_map = generate_node_map_graph(16, seed=run_seed)
     current_node_idx = node_map.start
     node_depths = compute_node_depth(node_map, node_map.start)
 
     player = Player(*arena.center)
     applied = rule_based_dda(player.metrics, node_depth=0, hp_ratio=1.0)
 
-    session, writer, shard_path = new_human_telemetry_session(node_map)
+    session, writer, shard_path = new_human_telemetry_session(node_map, run_seed, controller)
     last_loot_kind = ""
 
     projectiles: List[Projectile] = []
@@ -757,11 +696,12 @@ def main(max_frames: Optional[int] = None):
         nonlocal node_map, current_node_idx, node_depths, player, state
         nonlocal session, writer, shard_path
         close_human_telemetry_session(session, writer, shard_path, player)
-        node_map = generate_node_map_graph(16, seed=None)
+        run_seed = random.randrange(2**31)
+        node_map = generate_node_map_graph(16, seed=run_seed)
         current_node_idx = node_map.start
         node_depths = compute_node_depth(node_map, node_map.start)
         player = Player(*arena.center)
-        session, writer, shard_path = new_human_telemetry_session(node_map)
+        session, writer, shard_path = new_human_telemetry_session(node_map, run_seed, controller)
         state = "arena"
         spawn_room(current_node_idx)
 

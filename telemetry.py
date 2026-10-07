@@ -31,27 +31,41 @@ Post-review fixes applied in this version:
 """
 
 from dataclasses import dataclass, field, fields as dc_fields
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import csv
 import json
 import os
 import subprocess
 import time
 
+import balance
 import dda_core as core
 
 # ---------------------------------------------------------------------------
 # Versions
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = "room_samples_v2.1"   # bumped: COND_DIM 6->9, new columns
+# v3.0: controller identity/fallback columns, run_seed, player_profile,
+# post_hp_ratio, experiment_config_version; cond_total_kills_norm is now
+# cumulative (dda_core condition contract v1.2).
+SCHEMA_VERSION = "room_samples_v3.0"
 GAME_VERSION = "0.4.0"
 GENERATOR_VERSION = "node_map_gen_v1"
-BOT_POLICY_VERSION = "dfs_backtrack_v1"
-DDA_VERSION = "rule_based_dda_v1.1"    # matches dda_core's v1.1 condition contract
+# v2: runs are derived from a per-run seed (independent of worker count) and
+# progress_norm counts rooms finished BEFORE the current one (matches rogue.py).
+BOT_POLICY_VERSION = "dfs_backtrack_v2"
+DDA_VERSION = "rule_based_dda_v1.2"    # matches dda_core's v1.2 condition contract
 
 COND_DIM = core.COND_DIM     # 9 -- single source of truth is dda_core
-TARGET_DIM = 4               # enemy_hp_mult, enemy_dmg_mult, enemy_speed_mult, spawn_count
+TARGET_DIM = core.ACTION_DIM  # 4: enemy_hp_mult, enemy_dmg_mult, enemy_speed_mult, spawn_count
+
+CONTROLLER_TYPES = ("fixed", "heuristic", "exploration", "cgan")
+
+COND_COLUMNS = ["cond_" + n for n in core.COND_NAMES]
+ACTION_RAW_COLUMNS = ["applied_raw_hp_mult", "applied_raw_dmg_mult",
+                      "applied_raw_speed_mult", "applied_raw_spawn_count"]
+ACTION_COLUMNS = ["applied_hp_mult", "applied_dmg_mult", "applied_speed_mult",
+                  "applied_spawn_count"]
 
 RECENT_WINDOW_ROOMS = 3
 
@@ -84,8 +98,11 @@ def config_hash(extra: Optional[dict] = None) -> str:
 # ---------------------------------------------------------------------------
 
 ROOM_SAMPLE_COLUMNS = [
-    # identity / position
-    "run_id", "room_seq", "room_idx", "room_kind", "node_depth",
+    # identity / position. run_seed reproduces the map/bot of a run (the
+    # same run_seed under two controllers = an equivalent-seed pair).
+    # player_profile is METADATA ONLY (bot archetype name or "human") --
+    # used for stratification, never as a model input.
+    "run_id", "run_seed", "player_profile", "room_seq", "room_idx", "room_kind", "node_depth",
     "progress_norm", "is_combat_room",
 
     # pre-state (cumulative, captured BEFORE this room's config is decided)
@@ -109,6 +126,12 @@ ROOM_SAMPLE_COLUMNS = [
     "cond_dmg_ratio", "cond_hp_ratio", "cond_total_kills_norm",
     "cond_node_depth_norm", "cond_progress_norm",
 
+    # controller identity for the decision of THIS room. action_source is
+    # the exploration branch (perturb|uniform|reference) or the controller
+    # type; fallback_* record any cGAN -> heuristic fallback and why.
+    "controller_type", "controller_version", "model_checkpoint_id",
+    "action_source", "fallback_used", "fallback_reason",
+
     # raw DDA/model output BEFORE room-kind modifiers (e.g. boss multipliers)
     "applied_raw_hp_mult", "applied_raw_dmg_mult", "applied_raw_speed_mult",
     "applied_raw_spawn_count",
@@ -120,20 +143,22 @@ ROOM_SAMPLE_COLUMNS = [
     "applied_loot_bias_armor", "applied_loot_bias_boots",
 
     # outcome (post-room delta only -- strictly this room's contribution)
-    "room_result", "died_in_room", "melee_kills_in_room", "magic_kills_in_room",
+    "room_result", "died_in_room", "post_hp_ratio", "melee_kills_in_room", "magic_kills_in_room",
     "melee_hits_in_room", "magic_hits_in_room", "damage_taken_in_room",
     "damage_dealt_in_room", "time_in_room", "loot_taken_kind",
 
     # versioning (redundant per-row so a row is self-describing even split
     # out of its manifest/shard context)
     "schema_version", "game_version", "generator_version",
-    "bot_policy_version", "dda_version",
+    "bot_policy_version", "dda_version", "experiment_config_version",
 ]
 
 
 @dataclass
 class RoomSample:
     run_id: str
+    run_seed: int
+    player_profile: str
     room_seq: int
     room_idx: int
     room_kind: str
@@ -169,6 +194,13 @@ class RoomSample:
     cond_node_depth_norm: float
     cond_progress_norm: float
 
+    controller_type: str
+    controller_version: str
+    model_checkpoint_id: str
+    action_source: str
+    fallback_used: int
+    fallback_reason: str
+
     applied_raw_hp_mult: float
     applied_raw_dmg_mult: float
     applied_raw_speed_mult: float
@@ -185,6 +217,7 @@ class RoomSample:
 
     room_result: str
     died_in_room: int
+    post_hp_ratio: float
     melee_kills_in_room: int
     magic_kills_in_room: int
     melee_hits_in_room: int
@@ -199,6 +232,7 @@ class RoomSample:
     generator_version: str = GENERATOR_VERSION
     bot_policy_version: str = BOT_POLICY_VERSION
     dda_version: str = DDA_VERSION
+    experiment_config_version: str = ""
 
     def as_row(self) -> List:
         d = self.__dict__
@@ -256,6 +290,94 @@ def loot_bias_to_cols(loot_bias: Optional[List[float]]) -> Dict[str, float]:
     return dict(zip(["weapon", "spell", "armor", "boots"], loot_bias))
 
 
+def build_condition(pre: dict, recent: "RecentWindow", hp_ratio: float,
+                    node_depth: int, progress_norm: float) -> Tuple[List[float], dict, int]:
+    """
+    THE official pre-room condition (shared by bot_runner.py and rogue.py):
+    behavioral components from the RECENT WINDOW (falling back to the
+    cumulative-so-far snapshot when the window is empty, i.e. the first room
+    of a run); hp_ratio instantaneous; total_kills_norm CUMULATIVE (from
+    `pre`); node_depth_norm/progress_norm contextual. Uses only information
+    available before the room starts. Returns (cond_vec, recent_totals,
+    recent_n).
+    """
+    recent_totals = recent.totals()
+    recent_n = recent.n_rooms()
+    src = recent_totals if recent_n > 0 else pre
+    cond = core.feature_vector_from_raw(
+        src["melee_kills"], src["magic_kills"], src["melee_hits"], src["magic_hits"],
+        src["damage_taken"], src["damage_dealt"],
+        hp_ratio, node_depth, progress_norm,
+        total_kills=pre["melee_kills"] + pre["magic_kills"],
+    )
+    return cond, recent_totals, recent_n
+
+
+def build_room_sample(
+    *, run_id: str, run_seed: int, player_profile: str, room_seq: int, room_idx: int,
+    room_kind: str, node_depth: int, progress_norm: float,
+    pre: dict, pre_hp_ratio: float, recent_totals: dict, recent_n: int,
+    cond_vec: List[float], controller_meta: dict, applied_raw: dict, applied: dict,
+    room_result: str, delta: dict, time_in_room: float, post_hp_ratio: float,
+    loot_taken_kind: str, experiment_config_version: str,
+) -> RoomSample:
+    """Assembles one RoomSample. Shared by bot_runner.py and rogue.py so the
+    human and synthetic contracts cannot drift."""
+    loot_cols = loot_bias_to_cols(applied_raw.get("loot_bias"))
+    c = dict(zip(COND_COLUMNS, cond_vec))
+    return RoomSample(
+        run_id=run_id, run_seed=int(run_seed), player_profile=player_profile,
+        room_seq=room_seq, room_idx=room_idx, room_kind=room_kind, node_depth=node_depth,
+        progress_norm=progress_norm,
+        is_combat_room=1 if room_kind in ("enemy", "boss") else 0,
+
+        pre_melee_kills=pre["melee_kills"], pre_magic_kills=pre["magic_kills"],
+        pre_melee_hits=pre["melee_hits"], pre_magic_hits=pre["magic_hits"],
+        pre_damage_taken=pre["damage_taken"], pre_damage_dealt=pre["damage_dealt"],
+        pre_deaths=pre["deaths"], pre_time_alive=pre["time_alive"],
+        pre_hp_ratio=pre_hp_ratio,
+
+        recent_melee_kills=recent_totals["melee_kills"],
+        recent_magic_kills=recent_totals["magic_kills"],
+        recent_melee_hits=recent_totals["melee_hits"],
+        recent_magic_hits=recent_totals["magic_hits"],
+        recent_damage_taken=recent_totals["damage_taken"],
+        recent_damage_dealt=recent_totals["damage_dealt"],
+        recent_n_rooms=recent_n,
+
+        **c,
+
+        controller_type=controller_meta["controller_type"],
+        controller_version=controller_meta["controller_version"],
+        model_checkpoint_id=controller_meta.get("model_checkpoint_id", ""),
+        action_source=controller_meta.get("action_source", ""),
+        fallback_used=int(controller_meta.get("fallback_used", 0)),
+        fallback_reason=controller_meta.get("fallback_reason", ""),
+
+        applied_raw_hp_mult=applied_raw["enemy_hp_mult"],
+        applied_raw_dmg_mult=applied_raw["enemy_dmg_mult"],
+        applied_raw_speed_mult=applied_raw["enemy_speed_mult"],
+        applied_raw_spawn_count=applied_raw["spawn_count"],
+
+        applied_hp_mult=applied["enemy_hp_mult"],
+        applied_dmg_mult=applied["enemy_dmg_mult"],
+        applied_speed_mult=applied["enemy_speed_mult"],
+        applied_spawn_count=applied["spawn_count"],
+        applied_loot_bias_weapon=loot_cols["weapon"],
+        applied_loot_bias_spell=loot_cols["spell"],
+        applied_loot_bias_armor=loot_cols["armor"],
+        applied_loot_bias_boots=loot_cols["boots"],
+
+        room_result=room_result, died_in_room=1 if room_result == "died" else 0,
+        post_hp_ratio=round(float(post_hp_ratio), 6),
+        melee_kills_in_room=delta["melee_kills"], magic_kills_in_room=delta["magic_kills"],
+        melee_hits_in_room=delta["melee_hits"], magic_hits_in_room=delta["magic_hits"],
+        damage_taken_in_room=delta["damage_taken"], damage_dealt_in_room=delta["damage_dealt"],
+        time_in_room=time_in_room, loot_taken_kind=loot_taken_kind,
+        experiment_config_version=experiment_config_version,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sharded writer
 # ---------------------------------------------------------------------------
@@ -290,6 +412,7 @@ def write_manifest(
     n_rows: int,
     seed_range: List[int],
     extra: Optional[dict] = None,
+    controller_counts: Optional[Dict[str, int]] = None,
 ) -> dict:
     """
     FIX (finding #7 wiring): `extra` is now actually passed into
@@ -298,12 +421,17 @@ def write_manifest(
     archetype definitions, etc.) are folded into the SAME hash that gets
     checked at load time -- not just recorded alongside it.
     """
+    exp_cfg = balance.load_experiment_config()
+    extra = dict(extra or {})
+    extra["experiment_config_hash"] = balance.experiment_config_hash(exp_cfg)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "game_version": GAME_VERSION,
         "generator_version": GENERATOR_VERSION,
         "bot_policy_version": BOT_POLICY_VERSION,
         "dda_version": DDA_VERSION,
+        "experiment_config_version": exp_cfg["experiment_config_version"],
+        "experiment_config_hash": extra["experiment_config_hash"],
         "config_hash": config_hash(extra=extra),
         "git_commit": git_commit_short(),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -312,8 +440,10 @@ def write_manifest(
         "target_dim": TARGET_DIM,
         "n_rows": n_rows,
         "columns": ROOM_SAMPLE_COLUMNS,
-        "extra": extra or {},
+        "extra": extra,
     }
+    if controller_counts is not None:
+        manifest["controller_counts"] = controller_counts
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
     return manifest
@@ -363,7 +493,9 @@ def merge_shards(shard_paths: List[str], out_csv_path: str) -> int:
 # Validation (finding #6: substantially strengthened)
 # ---------------------------------------------------------------------------
 
-def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = None) -> dict:
+def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = None,
+                     expected_extra_subset: Optional[dict] = None,
+                     strict_experiment_config: bool = True) -> dict:
     """
     Validates a dataset against BOTH internal consistency (manifest vs. CSV
     contents) AND the CURRENT CODE's own versions (manifest vs. what this
@@ -406,6 +538,31 @@ def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = 
                 f"codebase (re-generate it, or check out the matching commit)."
             )
 
+    # 1b. Experiment configuration (controllers, outcome definitions, balance
+    #     targets) must be the one currently on disk -- mixing datasets
+    #     collected under different exploration/targets is refused.
+    if strict_experiment_config:
+        exp_cfg = balance.load_experiment_config()
+        for key, expected in (
+            ("experiment_config_version", exp_cfg["experiment_config_version"]),
+            ("experiment_config_hash", balance.experiment_config_hash(exp_cfg)),
+        ):
+            if manifest.get(key) != expected:
+                raise DatasetVersionError(
+                    f"Manifest field '{key}' = {manifest.get(key)!r} does not match the "
+                    f"current experiment_config.json ({expected!r}).")
+
+    # 1c. Policy constants the CALLER knows (e.g. bot_runner's map/policy
+    #     parameters) must equal what the manifest recorded; the manifest's
+    #     own extra is otherwise only self-consistent, not current.
+    if expected_extra_subset:
+        mextra = manifest.get("extra") or {}
+        for k, v in expected_extra_subset.items():
+            if json.dumps(mextra.get(k), sort_keys=True) != json.dumps(v, sort_keys=True):
+                raise DatasetVersionError(
+                    f"Manifest extra[{k!r}] = {mextra.get(k)!r} does not match the "
+                    f"current code's {v!r}.")
+
     # 2. config_hash must match what the CURRENT code computes for the
     #    SAME extra payload the manifest itself recorded (recomputed, not
     #    trusted) -- this is the actual defect the review reproduced.
@@ -431,6 +588,8 @@ def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = 
     actual_n_rows = 0
     seen_keys = set()
     duplicate_keys = 0
+    controller_counts: Dict[str, int] = {}
+    n_fallback = 0
     with open(csv_path, newline="") as f:
         reader = csv.reader(f)
         header = next(reader, None)
@@ -438,14 +597,31 @@ def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = 
             raise DatasetVersionError(
                 "CSV header does not match telemetry.ROOM_SAMPLE_COLUMNS."
             )
-        run_id_idx = ROOM_SAMPLE_COLUMNS.index("run_id")
-        room_seq_idx = ROOM_SAMPLE_COLUMNS.index("room_seq")
+        idx = {c: ROOM_SAMPLE_COLUMNS.index(c) for c in (
+            "run_id", "room_seq", "schema_version", "controller_type", "fallback_used",
+            "is_combat_room")}
+        run_id_idx, room_seq_idx = idx["run_id"], idx["room_seq"]
         for i, row in enumerate(reader):
             if len(row) != len(ROOM_SAMPLE_COLUMNS):
                 raise DatasetVersionError(
                     f"Row {i} has {len(row)} columns, expected "
                     f"{len(ROOM_SAMPLE_COLUMNS)} (malformed/truncated row)."
                 )
+            if row[idx["schema_version"]] != SCHEMA_VERSION:
+                raise DatasetVersionError(
+                    f"Row {i} has schema_version {row[idx['schema_version']]!r}, "
+                    f"expected {SCHEMA_VERSION!r} (mixed-schema dataset).")
+            ctrl = row[idx["controller_type"]]
+            if ctrl not in CONTROLLER_TYPES:
+                raise DatasetVersionError(
+                    f"Row {i} has controller_type {ctrl!r}; every row must record "
+                    f"one of {CONTROLLER_TYPES}.")
+            if row[idx["fallback_used"]] not in ("0", "1"):
+                raise DatasetVersionError(
+                    f"Row {i} has fallback_used {row[idx['fallback_used']]!r} (expected 0/1).")
+            controller_counts[ctrl] = controller_counts.get(ctrl, 0) + 1
+            if row[idx["fallback_used"]] == "1":
+                n_fallback += 1
             actual_n_rows += 1
             key = (row[run_id_idx], row[room_seq_idx])
             if key in seen_keys:
@@ -470,4 +646,7 @@ def validate_dataset(csv_path: str, manifest_path: str, extra: Optional[dict] = 
         "n_rows": actual_n_rows,
         "schema_version": manifest["schema_version"],
         "config_hash": manifest["config_hash"],
+        "experiment_config_version": manifest.get("experiment_config_version"),
+        "controller_counts": controller_counts,
+        "n_fallback_rows": n_fallback,
     }

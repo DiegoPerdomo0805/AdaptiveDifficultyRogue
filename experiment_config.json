@@ -1,0 +1,69 @@
+{
+  "experiment_config_version": "exp_v1.0-pilot",
+  "status": "PILOT_PLACEHOLDER: balance targets are provisional and MUST be calibrated from the Stage A pilot (python balance.py calibrate ...), then frozen by changing status to FROZEN and bumping experiment_config_version before the principal collection.",
+
+  "controllers": {
+    "fixed": {
+      "version": "fixed_v1",
+      "action": {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3}
+    },
+    "heuristic": {
+      "version": "heuristic_rule_based_dda_v1.2"
+    },
+    "exploration": {
+      "version": "exploration_v1",
+      "mixture": {"perturb": 0.70, "uniform": 0.20, "reference": 0.10},
+      "perturb_log_sigma": {"enemy_hp_mult": 0.25, "enemy_dmg_mult": 0.25, "enemy_speed_mult": 0.12},
+      "perturb_spawn_delta": [-2, -1, 0, 1, 2],
+      "uniform_spawn_range": [2, 8],
+      "reference_actions": [
+        {"enemy_hp_mult": 0.8, "enemy_dmg_mult": 0.7, "enemy_speed_mult": 0.9, "spawn_count": 2},
+        {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3},
+        {"enemy_hp_mult": 2.2, "enemy_dmg_mult": 1.8, "enemy_speed_mult": 1.4, "spawn_count": 5}
+      ]
+    },
+    "cgan": {
+      "version": "cgan_outcome_guided_v1",
+      "max_invalid_outputs": 3
+    }
+  },
+
+  "outcomes": {
+    "columns": ["death", "post_hp_ratio", "dmg_ratio", "combat_efficiency", "duration_norm"],
+    "dmg_ratio_min_dealt": 1.0,
+    "dmg_ratio_cap": 5.0,
+    "duration_norm_seconds": 30.0,
+    "duration_norm_cap": 2.0
+  },
+
+  "balance_targets": {
+    "death":             {"low": 0.0,  "high": 0.08, "scale": 0.10, "weight": 3.0},
+    "post_hp_ratio":     {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
+    "dmg_ratio":         {"low": 0.10, "high": 0.45, "scale": 0.20, "weight": 1.0},
+    "combat_efficiency": {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
+    "duration_norm":     {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
+  },
+
+  "q_gate": {
+    "key_continuous_outputs": ["post_hp_ratio", "dmg_ratio"],
+    "min_r2_vs_mean": 0.0,
+    "require_death_brier_below_prevalence": true,
+    "min_action_gain_rel": 0.02
+  },
+
+  "cgan_selection": {
+    "w_invalid": 10.0,
+    "w_diversity": 0.5,
+    "diversity_cap": 0.10,
+    "w_sensitivity": 0.5,
+    "sensitivity_cap": 0.10,
+    "w_jitter": 0.25,
+    "diversity_samples": 8
+  },
+
+  "seed_blocks": {
+    "pilot": [100000, 199999],
+    "train_collection": [1000000, 4999999],
+    "evaluation": [9000000, 9999999]
+  }
+}

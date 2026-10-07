@@ -31,6 +31,22 @@ Post-review fixes applied here:
     has a death_rate slot at all -- see dda_core.py's hp_ratio-based
     replacement, threaded through here via `player.hp / player.max_hp`.
 
+cGAN_vs_heuristic changes (schema room_samples_v3.0, dfs_backtrack_v2):
+
+  * The DDA decision is delegated to a controller (controllers.py):
+    --controller fixed|heuristic|exploration|cgan, or a seeded per-run
+    mixture such as "exploration=0.65,heuristic=0.20,fixed=0.15".
+    Controller identity/fallback is logged on every row.
+  * Run i uses run_seed = --seed + i. Map, bot archetype, combat RNG and
+    controller RNG are independent streams derived from run_seed, so the
+    same seed range under two controllers yields equivalent maps/bots, and
+    results do not depend on --workers.
+  * run_id is deterministic: sha256(run_seed | controller | policy version).
+  * progress_norm counts rooms finished BEFORE the current one (as rogue.py).
+  * post_hp_ratio is logged so observed outcomes can be built.
+  * The archetype name is logged as player_profile (metadata only; never a
+    model input).
+
 DFS backtracking (validated correct pre-review, preserved unchanged):
 visited-set + explicit stack, descend into unvisited neighbors, backtrack
 to the parent when a branch is exhausted, hard step cap as an escape
@@ -38,16 +54,17 @@ hatch, explicit termination reasons.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import argparse
-import csv
-import glob
+import hashlib
+import json
 import os
 import random
 import sys
 import time
-import uuid
 
+import balance
+import controllers as ctl
 import dda_core as core
 import node_map_gen as nmg
 import telemetry
@@ -183,28 +200,40 @@ def _pick_from_offered(arch: Archetype, options: List[tuple], rng: random.Random
     return rng.randrange(len(options))
 
 
+def make_run_id(run_seed: int, controller_type: str) -> str:
+    key = f"{int(run_seed)}|{controller_type}|{telemetry.BOT_POLICY_VERSION}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
+
+
+def archetype_for_seed(run_seed: int) -> Archetype:
+    rng = random.Random(ctl.derive_seed(run_seed, "archetype"))
+    return ARCHETYPES[rng.randrange(len(ARCHETYPES))]
+
+
 def simulate_run(
-    arch: Archetype, master_rng: random.Random, invincible: bool = False,
-) -> Tuple[BotPlayer, List[telemetry.RoomSample], str, bool]:
+    run_seed: int, controller: "ctl.Controller", invincible: bool = False,
+    exp_version: str = "",
+) -> Tuple[BotPlayer, List[telemetry.RoomSample], str, bool, str]:
     """
-    Plays one full run via real DFS backtracking. Returns
-    (player, samples, termination_reason, boss_room_reached).
+    Plays one full run via real DFS backtracking under `controller`. Returns
+    (player, samples, termination_reason, boss_room_reached, archetype_name).
 
     termination_reason in {"victory", "death", "exhausted_no_boss",
     "max_steps_exceeded"}.
     """
-    seed = master_rng.randrange(2**31)
-    rng = random.Random(seed)
-    node_map = nmg.generate_node_map_graph(seed=seed, **{
+    arch = archetype_for_seed(run_seed)
+    rng = random.Random(ctl.derive_seed(run_seed, "combat"))
+    node_map = nmg.generate_node_map_graph(seed=ctl.derive_seed(run_seed, "map"), **{
         k: v for k, v in BOT_RUNNER_VERSION_EXTRA.items()
         if k in ("node_count", "cols", "rows", "extra_loops", "enemy_weight", "loot_weight")
     })
     total_rooms = len(node_map.nodes)
     depths = nmg.compute_node_depth(node_map, node_map.start)
+    controller.begin_run(run_seed)
 
     player = BotPlayer()
     recent = telemetry.RecentWindow()
-    run_id = uuid.uuid4().hex
+    run_id = make_run_id(run_seed, controller.controller_type)
     samples: List[telemetry.RoomSample] = []
 
     visited = {node_map.start}
@@ -225,44 +254,22 @@ def simulate_run(
         node = node_map.nodes[current]
 
         if current not in cleared:
+            # progress = rooms finished before this one (incl. start) / total
+            progress_norm = core.clamp(len(cleared) / max(total_rooms, 1), 0.0, 1.0)
             cleared.add(current)
             room_seq += 1
             depth = depths.get(current, 0)
-            progress_norm = core.clamp(len(cleared) / max(total_rooms, 1), 0.0, 1.0)
-            is_combat = 1 if node.kind in ("enemy", "boss") else 0
 
             pre = telemetry.metrics_snapshot(player.metrics)
             pre_hp_ratio = player.hp_ratio()
-            recent_totals = recent.totals()
-            recent_n = recent.n_rooms()
+            cond_vec, recent_totals, recent_n = telemetry.build_condition(
+                pre, recent, pre_hp_ratio, depth, progress_norm)
 
-            # --- Official condition vector (finding #3 decision) ---------
-            # Behavioral components from the RECENT WINDOW; hp_ratio is
-            # instantaneous; total_kills/node_depth/progress are cumulative
-            # contextual features. Falls back to cumulative-so-far if the
-            # window is still empty (first room of the run).
-            if recent_n > 0:
-                mk, gk = recent_totals["melee_kills"], recent_totals["magic_kills"]
-                mh, gh = recent_totals["melee_hits"], recent_totals["magic_hits"]
-                dt, dd = recent_totals["damage_taken"], recent_totals["damage_dealt"]
-            else:
-                mk, gk = pre["melee_kills"], pre["magic_kills"]
-                mh, gh = pre["melee_hits"], pre["magic_hits"]
-                dt, dd = pre["damage_taken"], pre["damage_dealt"]
-
-            cond_vec = core.feature_vector_from_raw(
-                mk, gk, mh, gh, dt, dd,
-                pre_hp_ratio, depth, progress_norm,
-            )
-            (cond_melee_ratio, cond_magic_ratio, cond_hpk_melee, cond_hpk_magic,
-             cond_dmg_ratio, cond_hp_ratio, cond_total_kills_norm,
-             cond_node_depth_norm, cond_progress_norm) = cond_vec
-
-            applied_raw = core.rule_based_dda(
-                player.metrics, node_depth=depth, hp_ratio=pre_hp_ratio,
-            )
+            decision = controller.decide(ctl.DecisionContext(
+                cond_vec=cond_vec, metrics=player.metrics, node_depth=depth,
+                hp_ratio=pre_hp_ratio, room_kind=node.kind))
+            applied_raw = decision.action
             applied = core.effective_applied_config(applied_raw, node.kind)
-            loot_cols = telemetry.loot_bias_to_cols(applied_raw.get("loot_bias"))
 
             room_result = "skipped"
             died_in_room = 0
@@ -294,57 +301,17 @@ def simulate_run(
 
             recent.push(delta)
 
-            sample = telemetry.RoomSample(
-                run_id=run_id, room_seq=room_seq, room_idx=current,
-                room_kind=node.kind, node_depth=depth,
-                progress_norm=progress_norm, is_combat_room=is_combat,
-
-                pre_melee_kills=pre["melee_kills"], pre_magic_kills=pre["magic_kills"],
-                pre_melee_hits=pre["melee_hits"], pre_magic_hits=pre["magic_hits"],
-                pre_damage_taken=pre["damage_taken"], pre_damage_dealt=pre["damage_dealt"],
-                pre_deaths=pre["deaths"], pre_time_alive=pre["time_alive"],
-                pre_hp_ratio=pre_hp_ratio,
-
-                recent_melee_kills=recent_totals["melee_kills"],
-                recent_magic_kills=recent_totals["magic_kills"],
-                recent_melee_hits=recent_totals["melee_hits"],
-                recent_magic_hits=recent_totals["magic_hits"],
-                recent_damage_taken=recent_totals["damage_taken"],
-                recent_damage_dealt=recent_totals["damage_dealt"],
-                recent_n_rooms=recent_n,
-
-                cond_melee_ratio=cond_melee_ratio, cond_magic_ratio=cond_magic_ratio,
-                cond_hpk_melee=cond_hpk_melee, cond_hpk_magic=cond_hpk_magic,
-                cond_dmg_ratio=cond_dmg_ratio, cond_hp_ratio=cond_hp_ratio,
-                cond_total_kills_norm=cond_total_kills_norm,
-                cond_node_depth_norm=cond_node_depth_norm,
-                cond_progress_norm=cond_progress_norm,
-
-                applied_raw_hp_mult=applied_raw["enemy_hp_mult"],
-                applied_raw_dmg_mult=applied_raw["enemy_dmg_mult"],
-                applied_raw_speed_mult=applied_raw["enemy_speed_mult"],
-                applied_raw_spawn_count=applied_raw["spawn_count"],
-
-                applied_hp_mult=applied["enemy_hp_mult"],
-                applied_dmg_mult=applied["enemy_dmg_mult"],
-                applied_speed_mult=applied["enemy_speed_mult"],
-                applied_spawn_count=applied["spawn_count"],
-                applied_loot_bias_weapon=loot_cols["weapon"],
-                applied_loot_bias_spell=loot_cols["spell"],
-                applied_loot_bias_armor=loot_cols["armor"],
-                applied_loot_bias_boots=loot_cols["boots"],
-
-                room_result=room_result, died_in_room=died_in_room,
-                melee_kills_in_room=delta["melee_kills"],
-                magic_kills_in_room=delta["magic_kills"],
-                melee_hits_in_room=delta["melee_hits"],
-                magic_hits_in_room=delta["magic_hits"],
-                damage_taken_in_room=delta["damage_taken"],
-                damage_dealt_in_room=delta["damage_dealt"],
-                time_in_room=delta["time_in_room"],
-                loot_taken_kind=loot_taken_kind,
-            )
-            samples.append(sample)
+            samples.append(telemetry.build_room_sample(
+                run_id=run_id, run_seed=run_seed, player_profile=arch.name,
+                room_seq=room_seq, room_idx=current, room_kind=node.kind,
+                node_depth=depth, progress_norm=progress_norm,
+                pre=pre, pre_hp_ratio=pre_hp_ratio,
+                recent_totals=recent_totals, recent_n=recent_n, cond_vec=cond_vec,
+                controller_meta=decision.meta(), applied_raw=applied_raw, applied=applied,
+                room_result=room_result, delta=delta, time_in_room=delta["time_in_room"],
+                post_hp_ratio=player.hp_ratio(), loot_taken_kind=loot_taken_kind,
+                experiment_config_version=exp_version,
+            ))
 
             if current == node_map.boss and room_result == "cleared":
                 boss_room_reached = True
@@ -364,26 +331,74 @@ def simulate_run(
         if not advanced:
             stack.pop()
 
-    return player, samples, termination_reason, boss_room_reached
+    return player, samples, termination_reason, boss_room_reached, arch.name
+
+
+# ---------------------------------------------------------------------------
+# Controller specification: "exploration" or "exploration=0.65,heuristic=0.2"
+# ---------------------------------------------------------------------------
+
+def parse_controller_spec(spec: str) -> Dict[str, float]:
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if len(parts) == 1 and "=" not in parts[0]:
+        mix = {parts[0]: 1.0}
+    else:
+        mix = {}
+        for p in parts:
+            if "=" not in p:
+                raise ValueError(f"bad controller mixture element {p!r} (want name=weight)")
+            k, v = p.split("=", 1)
+            mix[k.strip()] = float(v)
+    for k, w in mix.items():
+        if k not in telemetry.CONTROLLER_TYPES:
+            raise ValueError(f"unknown controller {k!r}; choose from {telemetry.CONTROLLER_TYPES}")
+        if w < 0:
+            raise ValueError(f"negative weight for controller {k!r}")
+    total = sum(mix.values())
+    if total <= 0:
+        raise ValueError("controller mixture weights must sum to > 0")
+    return {k: v / total for k, v in mix.items()}
+
+
+def controller_for_run(run_seed: int, mix: Dict[str, float]) -> str:
+    if len(mix) == 1:
+        return next(iter(mix))
+    r = random.Random(ctl.derive_seed(run_seed, "controller_mix")).random()
+    acc = 0.0
+    for k in sorted(mix):
+        acc += mix[k]
+        if r < acc:
+            return k
+    return sorted(mix)[-1]
 
 
 # ---------------------------------------------------------------------------
 # Batch worker + CLI
 # ---------------------------------------------------------------------------
 
-def _run_archetype_batch(args) -> Tuple[str, int, dict]:
-    worker_id, n_runs, seed, invincible, shard_dir = args
-    master_rng = random.Random(seed)
-    shard_path = os.path.join(shard_dir, f"shard_{worker_id}.csv")
+def _run_batch(args) -> Tuple[str, int, dict]:
+    worker_id, run_seeds, mix, model_dir, invincible, shard_dir = args
+    exp_cfg = balance.load_experiment_config()
+    controllers = {name: ctl.make_controller(name, model_dir=model_dir, cfg=exp_cfg) for name in mix}
+    shard_path = os.path.join(shard_dir, f"shard_{worker_id:04d}.csv")
     writer = telemetry.open_shard_writer(shard_path)
 
-    stats = {"runs": 0, "boss_reached": 0, "termination_reasons": {}}
-    for _ in range(n_runs):
-        arch = ARCHETYPES[master_rng.randrange(len(ARCHETYPES))]
-        player, samples, reason, boss_reached = simulate_run(arch, master_rng, invincible=invincible)
+    stats = {"runs": 0, "boss_reached": 0, "termination_reasons": {},
+             "controller_runs": {}, "fallback_rows": 0, "fallback_reasons": {},
+             "controllers": {k: c.describe() for k, c in controllers.items()}}
+    for run_seed in run_seeds:
+        name = controller_for_run(run_seed, mix)
+        player, samples, reason, boss_reached, _ = simulate_run(
+            run_seed, controllers[name], invincible=invincible,
+            exp_version=exp_cfg["experiment_config_version"])
         for s in samples:
             writer.write(s)
+            if s.fallback_used:
+                stats["fallback_rows"] += 1
+                stats["fallback_reasons"][s.fallback_reason] = \
+                    stats["fallback_reasons"].get(s.fallback_reason, 0) + 1
         stats["runs"] += 1
+        stats["controller_runs"][name] = stats["controller_runs"].get(name, 0) + 1
         if boss_reached:
             stats["boss_reached"] += 1
         stats["termination_reasons"][reason] = stats["termination_reasons"].get(reason, 0) + 1
@@ -392,58 +407,99 @@ def _run_archetype_batch(args) -> Tuple[str, int, dict]:
     return shard_path, n_written, stats
 
 
-def _print_validation_report(all_stats: List[dict]):
-    total_runs = sum(s["runs"] for s in all_stats)
-    total_boss = sum(s["boss_reached"] for s in all_stats)
-    reasons = {}
+def _merge_stats(all_stats: List[dict]) -> dict:
+    out = {"runs": 0, "boss_reached": 0, "termination_reasons": {}, "controller_runs": {},
+           "fallback_rows": 0, "fallback_reasons": {}}
     for s in all_stats:
-        for k, v in s["termination_reasons"].items():
-            reasons[k] = reasons.get(k, 0) + v
-    print(f"runs={total_runs} boss_reached={total_boss} "
-          f"({100.0*total_boss/max(total_runs,1):.1f}%)")
-    for k, v in sorted(reasons.items()):
+        out["runs"] += s["runs"]
+        out["boss_reached"] += s["boss_reached"]
+        out["fallback_rows"] += s["fallback_rows"]
+        for key in ("termination_reasons", "controller_runs", "fallback_reasons"):
+            for k, v in s[key].items():
+                out[key][k] = out[key].get(k, 0) + v
+    return out
+
+
+def _print_validation_report(stats: dict):
+    total_runs = stats["runs"]
+    print(f"runs={total_runs} boss_reached={stats['boss_reached']} "
+          f"({100.0 * stats['boss_reached'] / max(total_runs, 1):.1f}%)")
+    for k, v in sorted(stats["termination_reasons"].items()):
         print(f"  {k}: {v}")
+    print("controller runs:", dict(sorted(stats["controller_runs"].items())))
+    print(f"fallback rows: {stats['fallback_rows']}", dict(stats["fallback_reasons"]) or "")
 
 
-def main():
-    ap = argparse.ArgumentParser()
+def policy_extra() -> dict:
+    """Semantically relevant bot constants folded into the manifest/config_hash."""
+    extra = dict(BOT_RUNNER_VERSION_EXTRA)
+    extra["archetypes"] = [a.__dict__ for a in ARCHETYPES]
+    extra["source"] = "bot"
+    return extra
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Headless bot data generator (authoritative). Emits one RoomSample per room.")
     ap.add_argument("--runs", type=int, default=40)
-    ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--out", type=str, default="room_samples_v2.csv")
+    ap.add_argument("--seed", type=int, default=1234,
+                    help="first run_seed; run i uses run_seed = seed + i")
+    ap.add_argument("--controller", type=str, default="heuristic",
+                    help="fixed|heuristic|exploration|cgan, or a per-run mixture such as "
+                         "'exploration=0.65,heuristic=0.20,fixed=0.15'")
+    ap.add_argument("--model-dir", type=str, default=None,
+                    help="cGAN model directory (required when the cgan controller is used)")
+    ap.add_argument("--out", type=str, default="room_samples_v3.csv")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--invincible", action="store_true")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--keep-shards", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--overwrite", action="store_true", help="allow replacing an existing --out")
+    args = ap.parse_args(argv)
+
+    mix = parse_controller_spec(args.controller)
+    if "cgan" in mix and not args.model_dir:
+        ap.error("--model-dir is required when the cgan controller is used")
+    if os.path.exists(args.out) and not args.overwrite:
+        ap.error(f"{args.out} already exists (pass --overwrite to replace it)")
 
     shard_dir = args.out + ".shards"
     os.makedirs(shard_dir, exist_ok=True)
+    t0 = time.time()
 
-    per_worker = max(1, args.runs // args.workers)
-    tasks = []
-    for w in range(args.workers):
-        n = per_worker if w < args.workers - 1 else (args.runs - per_worker * (args.workers - 1))
-        tasks.append((w, n, args.seed + w * 100003, args.invincible, shard_dir))
+    seeds = [args.seed + i for i in range(args.runs)]
+    n_workers = max(1, min(args.workers, len(seeds)))
+    chunk = (len(seeds) + n_workers - 1) // n_workers
+    tasks = [(w, seeds[w * chunk:(w + 1) * chunk], mix, args.model_dir, args.invincible, shard_dir)
+             for w in range(n_workers) if seeds[w * chunk:(w + 1) * chunk]]
 
-    results = []
-    if args.workers > 1:
+    if len(tasks) > 1:
         from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            results = list(ex.map(_run_archetype_batch, tasks))
+        with ProcessPoolExecutor(max_workers=len(tasks)) as ex:
+            results = list(ex.map(_run_batch, tasks))
     else:
-        results = [_run_archetype_batch(t) for t in tasks]
+        results = [_run_batch(t) for t in tasks]
 
     shard_paths = [r[0] for r in results]
     total_written = telemetry.merge_shards(shard_paths, args.out)
+    stats = _merge_stats([r[2] for r in results])
 
     manifest_path = os.path.splitext(args.out)[0] + ".manifest.json"
-    extra = dict(BOT_RUNNER_VERSION_EXTRA)
-    extra["archetypes"] = [a.name for a in ARCHETYPES]
-    telemetry.write_manifest(
+    extra = policy_extra()
+    manifest = telemetry.write_manifest(
         manifest_path, n_rows=total_written,
-        seed_range=[args.seed, args.seed + args.workers * 100003],
-        extra=extra,
+        seed_range=[args.seed, args.seed + args.runs - 1],
+        extra=extra, controller_counts=stats["controller_runs"],
     )
+    # Controller details are recorded (not hashed) so that datasets from
+    # different controllers under the same code/config can be merged.
+    manifest["controller_spec"] = mix
+    manifest["controllers"] = results[0][2]["controllers"]
+    manifest["run_stats"] = stats
+    manifest["command"] = " ".join([os.path.basename(sys.argv[0])] + (argv if argv is not None else sys.argv[1:]))
+    manifest["elapsed_sec"] = round(time.time() - t0, 3)
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
 
     if not args.keep_shards:
         for sp in shard_paths:
@@ -453,15 +509,16 @@ def main():
         except OSError:
             pass
 
-    print(f"wrote {total_written} rows -> {args.out}")
+    print(f"wrote {total_written} rows -> {args.out}  ({time.time() - t0:.1f}s)")
     print(f"manifest -> {manifest_path}")
 
-    _print_validation_report([r[2] for r in results])
+    _print_validation_report(stats)
 
     if args.validate:
-        report = telemetry.validate_dataset(args.out, manifest_path, extra=extra)
+        report = telemetry.validate_dataset(args.out, manifest_path, expected_extra_subset=extra)
         print("validate_dataset:", report)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

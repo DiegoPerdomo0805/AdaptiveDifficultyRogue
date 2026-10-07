@@ -11,7 +11,15 @@ rogue.py, bot_runner.py, cGAN.py and train_cgan.py:
   * enemy "ram" (offensive dash) tuning
   * config_hash() — a semantic fingerprint of every DDA-relevant constant
 
-CONDITION VECTOR CONTRACT — v1.1 (COND_DIM = 9)
+CONDITION VECTOR CONTRACT — v1.2 (COND_DIM = 9)
+------------------------------------------------
+v1.2 (schema room_samples_v3.0) keeps the v1.1 order and meaning except
+that `total_kills_norm` is now truly CUMULATIVE (it was computed from the
+3-room recent window in v1.1, contradicting the documented contract and
+hiding rule_based_dda()'s cumulative kill input). See
+feature_vector_from_raw().
+
+v1.1 history
 ------------------------------------------------
 This revises the original 6-dim vector after an external review found two
 real defects:
@@ -69,6 +77,12 @@ TOTAL_KILLS_NORM_CAP = 30.0   # total_kills clamp ceiling for normalization
 NODE_DEPTH_NORM_CAP  = 10.0   # node_depth clamp ceiling for normalization
 
 COND_DIM = 9   # see module docstring — was 6 under schema v1
+
+# Ordered names of the condition vector (THE order; schema bump to change).
+COND_NAMES = [
+    "melee_ratio", "magic_ratio", "hpk_melee", "hpk_magic", "dmg_ratio",
+    "hp_ratio", "total_kills_norm", "node_depth_norm", "progress_norm",
+]
 
 
 def clamp(v, a, b):
@@ -222,6 +236,7 @@ def feature_vector_from_raw(
     melee_k, magic_k, melee_h, magic_h,
     dmg_taken, dmg_dealt,
     hp_ratio, node_depth, progress_norm,
+    total_kills: Optional[float] = None,
 ) -> List[float]:
     """
     THE single definition of the 9-dim condition vector (schema v1.1):
@@ -236,16 +251,25 @@ def feature_vector_from_raw(
     `progress_norm` are the three additions the review requested, exposing
     exactly what rule_based_dda() actually conditions on.
 
-    Every caller (CombatMetrics.to_feature_vector, bot_runner.py,
-    train_cgan.py) goes through this one function.
+    Every caller (CombatMetrics.to_feature_vector, telemetry.build_condition)
+    goes through this one function.
+
+    v1.2 FIX: `total_kills` is the CUMULATIVE run kill count used for
+    `total_kills_norm`. The behavioral counts (melee_k/magic_k/...) come from
+    the recent window, and v1.1 derived total_kills_norm from those windowed
+    counts too -- contradicting the documented "cumulative" contract and
+    re-hiding rule_based_dda()'s cumulative-kill input from the model. When
+    `total_kills` is None the behavioral counts are used (correct only when
+    they are themselves cumulative, as in CombatMetrics.to_feature_vector).
     """
     melee_k, magic_k = float(melee_k), float(magic_k)
     melee_h, magic_h = float(melee_h), float(magic_h)
     dmg_taken, dmg_dealt = float(dmg_taken), float(dmg_dealt)
 
-    total_kills = melee_k + magic_k
-    melee_ratio = (melee_k / total_kills) if total_kills > 0 else 0.5
-    magic_ratio = (magic_k / total_kills) if total_kills > 0 else 0.5
+    window_kills = melee_k + magic_k
+    total_kills = window_kills if total_kills is None else float(total_kills)
+    melee_ratio = (melee_k / window_kills) if window_kills > 0 else 0.5
+    magic_ratio = (magic_k / window_kills) if window_kills > 0 else 0.5
 
     hpk_melee = (melee_h / melee_k) if melee_k > 0 else float(melee_h + 1)
     hpk_magic = (magic_h / magic_k) if magic_k > 0 else float(magic_h + 1)
@@ -315,6 +339,61 @@ BOSS_HP_MULT    = 4.0
 BOSS_DMG_MULT   = 1.7
 BOSS_SPEED_MULT = 0.9
 BOSS_SPAWN_N    = 1
+
+
+# ---------------------------------------------------------------------------
+# Enemy intervention (action) space -- shared by EVERY controller (fixed,
+# heuristic, exploration, cGAN) and by the trainer/runtime. The design bounds
+# are the same ones rule_based_dda() clamps into.
+# ---------------------------------------------------------------------------
+
+ACTION_KEYS = ["enemy_hp_mult", "enemy_dmg_mult", "enemy_speed_mult", "spawn_count"]
+ACTION_DIM = len(ACTION_KEYS)
+ACTION_BOUNDS = {
+    "enemy_hp_mult": DDA_HP_MULT_BOUNDS,
+    "enemy_dmg_mult": DDA_DMG_MULT_BOUNDS,
+    "enemy_speed_mult": DDA_SPEED_MULT_BOUNDS,
+    "spawn_count": DDA_SPAWN_BOUNDS,
+}
+
+
+class ActionValidationError(ValueError):
+    pass
+
+
+def finalize_action(raw: dict) -> dict:
+    """
+    Deterministic action finalization applied to EVERY controller's raw
+    proposal before effective_applied_config(): rejects non-finite values,
+    clamps into ACTION_BOUNDS, rounds multipliers to 3 decimals and converts
+    spawn_count to an int (round-half-even via round()). Extra keys (e.g.
+    loot_bias) are passed through untouched.
+    """
+    import math
+    out = dict(raw)
+    for k in ACTION_KEYS:
+        if k not in raw:
+            raise ActionValidationError(f"action is missing {k!r}")
+        try:
+            v = float(raw[k])
+        except (TypeError, ValueError):
+            raise ActionValidationError(f"action {k!r}={raw[k]!r} is not numeric")
+        if not math.isfinite(v):
+            raise ActionValidationError(f"action {k!r}={v!r} is not finite")
+        lo, hi = ACTION_BOUNDS[k]
+        v = clamp(v, lo, hi)
+        out[k] = int(round(v)) if k == "spawn_count" else round(v, 3)
+    return out
+
+
+def action_was_clamped(raw: dict) -> bool:
+    """True when finalize_action() had to move a finite raw value into bounds."""
+    for k in ACTION_KEYS:
+        lo, hi = ACTION_BOUNDS[k]
+        v = float(raw[k])
+        if v < lo - 1e-9 or v > hi + 1e-9:
+            return True
+    return False
 
 
 def rule_based_dda(metrics: CombatMetrics, node_depth: int = 0, hp_ratio: float = 1.0) -> dict:
@@ -438,6 +517,9 @@ def config_hash(extra: Optional[dict] = None) -> str:
     """
     payload = {
         "COND_DIM": COND_DIM,
+        "COND_NAMES": COND_NAMES,
+        "COND_CONTRACT": "v1.2_cumulative_total_kills",
+        "ACTION_KEYS": ACTION_KEYS,
         "TOTAL_KILLS_NORM_CAP": TOTAL_KILLS_NORM_CAP,
         "NODE_DEPTH_NORM_CAP": NODE_DEPTH_NORM_CAP,
 
