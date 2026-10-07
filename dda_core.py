@@ -237,7 +237,7 @@ def feature_vector_from_raw(
     exactly what rule_based_dda() actually conditions on.
 
     Every caller (CombatMetrics.to_feature_vector, bot_runner.py,
-    train_cgan_v2.py) goes through this one function.
+    train_cgan.py) goes through this one function.
     """
     melee_k, magic_k = float(melee_k), float(magic_k)
     melee_h, magic_h = float(melee_h), float(magic_h)

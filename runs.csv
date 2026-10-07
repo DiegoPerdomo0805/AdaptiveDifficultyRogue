@@ -16458,4 +16458,7 @@ bot_magic_sniper_03318,2,5,10,43,138.788,454.0,1,49.3,Rusty Blade,Ice Needle,Lea
 bot_magic_sniper_03319,2,6,20,31,164.528,578.0,1,48.117,Rusty Blade,Hex Spike,Voidstep Treads,Chain Shirt,2.257,1.918,1.33,5,8
 bot_magic_sniper_03320,3,3,12,29,132.974,408.0,1,22.917,Rusty Blade,Ice Needle,Leather Boots,Chain Shirt,1.666,1.416,1.113,4,8
 bot_magic_sniper_03321,3,5,15,40,171.251,588.0,1,82.217,Hatchet,Ember Bolt,Leather Boots,Chain Shirt,2.257,1.918,1.33,5,8
-bot_magic_sniper_03322,3,5,16,51,152.467,564.0,1,53.75,Rapier,Ice Needle,Leather Boots,Chain Shirt,1.989,1.691,1.302,4,8
+bot_magic_sniper_03322,3,5,16,51,152.467,564.0,1,53.75,Rapier,Ice Needle,Leather Boots,Chain Shirt,1.989,1.691,1.302,4,8run_16998,3,2,9,23,146.627,329.0,1,53.022,Rusty Blade,Ember Bolt,Voidstep Treads,Chain Shirt,1.463,1.244,1.09,3,8
+run_16998,3,2,9,23,146.627,329.0,1,53.022,Rusty Blade,Ember Bolt,Voidstep Treads,Chain Shirt,1.463,1.244,1.09,3,8
+run_80901,0,0,3,0,103.853,27.0,1,7.369,Rapier,Hex Spike,Leather Boots,Chain Shirt,1.06,0.901,1.0,2,8
+run_80901,0,0,3,0,103.853,27.0,1,7.369,Rapier,Hex Spike,Leather Boots,Chain Shirt,1.06,0.901,1.0,2,8
