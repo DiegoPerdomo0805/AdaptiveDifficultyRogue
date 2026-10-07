@@ -1,271 +1,269 @@
-from dataclasses import dataclass
-from typing import List, Tuple
+"""
+train_cgan.py
+=============
+Outcome-guided conditional GAN (replaces the former heuristic-imitation
+trainer, which minimized BCE_adv + 0.5 * MSE(G(x), heuristic applied_*)).
+
+  python train_cgan.py --csv pilot.csv --q-dir q_out --out-dir model_out
+
+  G(x, z) -> candidate action a (bounded in the design box by construction)
+  D(x, a) -> plausibility of observed vs. generated (x, a) pairs
+  Q(x, a) -> expected outcome; trained by train_q.py on observed outcomes
+             and FROZEN here
+
+  L_D = BCE(D(x, a_obs), 1) + BCE(D(x, G(x, z)), 0)
+  L_G = L_adv + lambda_balance * L_balance + lambda_diversity * L_diversity
+    L_adv       = BCE(D(x, G(x, z1)), 1)                (stay in the observed
+                                                          safe action support)
+    L_balance   = balance.balance_loss_torch(Q(x, G(x, z1)))   (targets from
+                                                          experiment_config.json)
+    L_diversity = mean(relu(tau - |G(x,z1)-G(x,z2)|_1 / |z1-z2|_1))
+
+The observed actions a_obs (from fixed, heuristic AND exploration rows)
+only enter the discriminator as samples of the plausible action support.
+There is no reconstruction loss against heuristic actions and no warm-up.
+
+The best checkpoint is selected by models.selection_score() on validation
+runs (validity, Q-predicted balance, diversity, conditional sensitivity,
+temporal jitter) -- never by generator loss. The train/val/test split and
+the condition scaler are taken from the Q checkpoint so G is validated on
+exactly the runs Q never trained on.
+"""
+
 import argparse
-import csv
+import copy
+import hashlib
+import io
 import json
 import os
 import random
+import sys
+import time
 
+import balance
 import dda_core as core
+import ml_data
 import telemetry
 
-try:
-    import torch
-    import torch.nn as nn
-except ImportError:
-    torch = None
-    nn = object
-
-COND_DIM = core.COND_DIM      # 9
-TARGET_DIM = telemetry.TARGET_DIM  # 4: hp_mult, dmg_mult, speed_mult, spawn_count
-
-COND_COLUMNS = [
-    "cond_melee_ratio", "cond_magic_ratio", "cond_hpk_melee", "cond_hpk_magic",
-    "cond_dmg_ratio", "cond_hp_ratio", "cond_total_kills_norm",
-    "cond_node_depth_norm", "cond_progress_norm",
-]
-TARGET_COLUMNS = ["applied_hp_mult", "applied_dmg_mult", "applied_speed_mult",
-                   "applied_spawn_count"]
-
-CHECKPOINT_SCHEMA_VERSION = "cgan_v2_checkpoint_1"
+CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v3"
+COND_COLUMNS = ml_data.COND_COLUMNS
+ACTION_COLUMNS = ml_data.ACTION_COLUMNS
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-def load_dataset_rows(csv_path: str, manifest_path: str,
-                       include_boss: bool = False, boss_only: bool = False) -> List[dict]:
-    """
-    Loads and filters rows. Raises telemetry.DatasetVersionError if the
-    dataset doesn't validate against the current code (finding #9.1/#9.8).
-    """
-    telemetry.validate_dataset(csv_path, manifest_path)
-
-    rows = []
-    with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            if boss_only:
-                if r["room_kind"] != "boss":
-                    continue
-            else:
-                if r["room_kind"] not in ("enemy", "boss"):
-                    continue
-                if r["room_kind"] == "boss" and not include_boss:
-                    continue
-            rows.append(r)
-    return rows
+def _ordered_runs(rows):
+    """Rows sorted by (run_id, room_seq) and the parallel run index list."""
+    rows = sorted(rows, key=lambda r: (r["run_id"], int(r["room_seq"])))
+    return rows, [r["run_id"] for r in rows]
 
 
-def group_split_by_run_id(rows: List[dict], val_frac: float, seed: int) -> Tuple[List[dict], List[dict]]:
-    """Group-aware split: all rows for a given run_id go entirely to train
-    OR entirely to val, never split across both (prevents leakage)."""
-    run_ids = sorted(set(r["run_id"] for r in rows))
-    rng = random.Random(seed)
-    rng.shuffle(run_ids)
-    n_val_runs = max(1, int(len(run_ids) * val_frac))
-    val_run_ids = set(run_ids[:n_val_runs])
-    train_rows = [r for r in rows if r["run_id"] not in val_run_ids]
-    val_rows = [r for r in rows if r["run_id"] in val_run_ids]
-    return train_rows, val_rows
+def _actions_n(matrix, torch, device):
+    return torch.tensor([ml_data.normalize_action(a) for a in matrix], dtype=torch.float32, device=device)
 
 
-def rows_to_arrays(rows: List[dict]):
-    cond = [[float(r[c]) for c in COND_COLUMNS] for r in rows]
-    target = [[float(r[c]) for c in TARGET_COLUMNS] for r in rows]
-    return cond, target
+def checkpoint_id_for(state_dict, torch) -> str:
+    buf = io.BytesIO()
+    torch.save({k: v.cpu() for k, v in state_dict.items()}, buf)
+    return hashlib.sha256(buf.getvalue()).hexdigest()[:16]
 
 
-@dataclass
-class Scaler:
-    target_mean: List[float]
-    target_std: List[float]
-
-    @staticmethod
-    def fit(targets: List[List[float]]) -> "Scaler":
-        n = len(targets)
-        dim = len(targets[0])
-        mean = [sum(t[i] for t in targets) / n for i in range(dim)]
-        var = [sum((t[i] - mean[i]) ** 2 for t in targets) / n for i in range(dim)]
-        std = [max(v ** 0.5, 1e-6) for v in var]
-        return Scaler(target_mean=mean, target_std=std)
-
-    def transform(self, targets: List[List[float]]) -> List[List[float]]:
-        return [[(t[i] - self.target_mean[i]) / self.target_std[i]
-                  for i in range(len(t))] for t in targets]
-
-    def inverse(self, scaled: List[float]) -> List[float]:
-        return [scaled[i] * self.target_std[i] + self.target_mean[i]
-                for i in range(len(scaled))]
-
-    def to_json(self) -> dict:
-        return {"target_mean": self.target_mean, "target_std": self.target_std,
-                "target_columns": TARGET_COLUMNS, "cond_columns": COND_COLUMNS}
-
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-if torch is not None:
-    class Generator(nn.Module):
-        def __init__(self, cond_dim=COND_DIM, noise_dim=8, target_dim=TARGET_DIM, hidden=64):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(cond_dim + noise_dim, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden), nn.ReLU(),
-                nn.Linear(hidden, target_dim),
-            )
-            self.noise_dim = noise_dim
-
-        def forward(self, cond, noise=None):
-            if noise is None:
-                noise = torch.randn(cond.shape[0], self.noise_dim, device=cond.device)
-            x = torch.cat([cond, noise], dim=1)
-            return self.net(x)
-
-    class Discriminator(nn.Module):
-        def __init__(self, cond_dim=COND_DIM, target_dim=TARGET_DIM, hidden=64):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(cond_dim + target_dim, hidden), nn.LeakyReLU(0.2),
-                nn.Linear(hidden, hidden), nn.LeakyReLU(0.2),
-                nn.Linear(hidden, 1), nn.Sigmoid(),
-            )
-
-        def forward(self, cond, target):
-            x = torch.cat([cond, target], dim=1)
-            return self.net(x)
-else:
-    Generator = None
-    Discriminator = None
-
-
-def train(
-    csv_path: str, manifest_path: str, out_dir: str,
-    epochs: int = 30, batch_size: int = 32, val_frac: float = 0.2, seed: int = 0,
-    include_boss: bool = False,
-):
-    if torch is None:
-        raise RuntimeError("PyTorch is required to train (pip install torch).")
-
-    os.makedirs(out_dir, exist_ok=True)
-    torch.manual_seed(seed)
-
-    rows = load_dataset_rows(csv_path, manifest_path, include_boss=include_boss)
-    if len(rows) < 20:
-        raise RuntimeError(f"Only {len(rows)} combat rows after filtering -- too few to train on.")
-
-    train_rows, val_rows = group_split_by_run_id(rows, val_frac=val_frac, seed=seed)
-    if not train_rows or not val_rows:
-        raise RuntimeError("Group split by run_id produced an empty train or val set -- need more runs.")
-
-    train_cond, train_target = rows_to_arrays(train_rows)
-    val_cond, val_target = rows_to_arrays(val_rows)
-
-    scaler = Scaler.fit(train_target)
-    train_target_s = scaler.transform(train_target)
-    val_target_s = scaler.transform(val_target)
-
-    train_cond_t = torch.tensor(train_cond, dtype=torch.float32)
-    train_target_t = torch.tensor(train_target_s, dtype=torch.float32)
-    val_cond_t = torch.tensor(val_cond, dtype=torch.float32)
-    val_target_t = torch.tensor(val_target_s, dtype=torch.float32)
-
-    gen = Generator()
-    disc = Discriminator()
-    opt_g = torch.optim.Adam(gen.parameters(), lr=2e-3, betas=(0.5, 0.999))
-    opt_d = torch.optim.Adam(disc.parameters(), lr=2e-3, betas=(0.5, 0.999))
-    bce = nn.BCELoss()
-
-    n = train_cond_t.shape[0]
-    history = []
-    for epoch in range(epochs):
-        perm = torch.randperm(n)
-        epoch_g_loss, epoch_d_loss = 0.0, 0.0
-        n_batches = 0
-        for start in range(0, n, batch_size):
-            idx = perm[start:start + batch_size]
-            cond_b = train_cond_t[idx]
-            real_b = train_target_t[idx]
-            bs = cond_b.shape[0]
-            if bs < 2:
-                continue
-
-            real_labels = torch.ones(bs, 1)
-            fake_labels = torch.zeros(bs, 1)
-
-            fake_b = gen(cond_b).detach()
-            d_real = disc(cond_b, real_b)
-            d_fake = disc(cond_b, fake_b)
-            d_loss = bce(d_real, real_labels) + bce(d_fake, fake_labels)
-            opt_d.zero_grad(); d_loss.backward(); opt_d.step()
-
-            fake_b2 = gen(cond_b)
-            d_fake2 = disc(cond_b, fake_b2)
-            recon_loss = nn.functional.mse_loss(fake_b2, real_b)
-            g_loss = bce(d_fake2, real_labels) + 0.5 * recon_loss
-            opt_g.zero_grad(); g_loss.backward(); opt_g.step()
-
-            epoch_g_loss += float(g_loss.detach()); epoch_d_loss += float(d_loss.detach())
-            n_batches += 1
-
-        with torch.no_grad():
-            val_pred = gen(val_cond_t)
-            val_mse = float(nn.functional.mse_loss(val_pred, val_target_t))
-
-        history.append({"epoch": epoch, "g_loss": epoch_g_loss / max(n_batches, 1),
-                         "d_loss": epoch_d_loss / max(n_batches, 1), "val_mse": val_mse})
-
-    manifest = telemetry.load_manifest(manifest_path)
-    checkpoint = {
-        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "dataset_schema_version": manifest["schema_version"],
-        "dda_version": manifest["dda_version"],
-        "config_hash": manifest["config_hash"],
-        "cond_dim": COND_DIM,
-        "target_dim": TARGET_DIM,
-        "cond_columns": COND_COLUMNS,
-        "target_columns": TARGET_COLUMNS,
-        "generator_state_dict": gen.state_dict(),
-        "discriminator_state_dict": disc.state_dict(),
-    }
-    ckpt_path = os.path.join(out_dir, "cgan_checkpoint.pt")
-    torch.save(checkpoint, ckpt_path)
-
-    scaler_path = os.path.join(out_dir, "scaler.json")
-    with open(scaler_path, "w") as f:
-        json.dump(scaler.to_json(), f, indent=2)
-
-    history_path = os.path.join(out_dir, "train_history.json")
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=2)
-
-    print(f"train_rows={len(train_rows)} val_rows={len(val_rows)}")
-    print(f"final val_mse={history[-1]['val_mse']:.4f}")
-    print(f"checkpoint -> {ckpt_path}")
-    print(f"scaler -> {scaler_path}")
-    return ckpt_path, scaler_path
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=str, default="room_samples_v2.csv")
-    ap.add_argument("--manifest", type=str, default=None)
-    ap.add_argument("--out-dir", type=str, default="model_out")
-    ap.add_argument("--epochs", type=int, default=30)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--val-frac", type=float, default=0.2)
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Train the outcome-guided cGAN generator.")
+    ap.add_argument("--csv", action="append", required=True,
+                    help="dataset CSV(s) -- must be exactly the ones Q was trained on")
+    ap.add_argument("--q-dir", required=True, help="directory holding q_checkpoint.pt")
+    ap.add_argument("--out-dir", default="model_out")
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--lr-g", type=float, default=5e-4)
+    ap.add_argument("--lr-d", type=float, default=5e-4)
+    ap.add_argument("--noise-dim", type=int, default=8)
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--lambda-balance", type=float, default=1.0)
+    ap.add_argument("--lambda-diversity", type=float, default=1.0)
+    ap.add_argument("--diversity-tau", type=float, default=0.05)
+    ap.add_argument("--patience", type=int, default=40, help="epochs without a better selection score")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--include-boss", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--device", default="cpu", help="cpu | cuda | auto")
+    ap.add_argument("--allow-failed-q-gate", action="store_true",
+                    help="SMOKE TESTS ONLY: train even though Q failed its gate (recorded)")
+    ap.add_argument("--overwrite", action="store_true")
+    args = ap.parse_args(argv)
 
-    manifest_path = args.manifest or (os.path.splitext(args.csv)[0] + ".manifest.json")
-    train(args.csv, manifest_path, args.out_dir, epochs=args.epochs,
-          batch_size=args.batch_size, val_frac=args.val_frac, seed=args.seed,
-          include_boss=args.include_boss)
+    import torch
+    import models
+    import bot_runner
+
+    ckpt_path = os.path.join(args.out_dir, "cgan_checkpoint.pt")
+    if os.path.exists(ckpt_path) and not args.overwrite:
+        ap.error(f"{ckpt_path} exists (pass --overwrite)")
+    os.makedirs(args.out_dir, exist_ok=True)
+    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    t0 = time.time()
+    cfg = balance.load_experiment_config()
+    sel_cfg = cfg["cgan_selection"]
+
+    # --- Q (frozen) and its data contract --------------------------------
+    qck = torch.load(os.path.join(args.q_dir, "q_checkpoint.pt"), map_location=device, weights_only=True)
+    gate = qck["gate"]
+    if not gate["passed"]:
+        msg = "Q failed its gate: " + "; ".join(gate["reasons"])
+        if not args.allow_failed_q_gate:
+            raise SystemExit(msg + "\nRefusing to train a generator guided by an inadequate Q "
+                                   "(collect more varied data). --allow-failed-q-gate is for smoke tests.")
+        print("WARNING:", msg, file=sys.stderr)
+    for key, cur in (("experiment_config_hash", balance.experiment_config_hash(cfg)),
+                     ("schema_version", telemetry.SCHEMA_VERSION),
+                     ("dda_version", telemetry.DDA_VERSION)):
+        if qck[key] != cur:
+            raise SystemExit(f"Q checkpoint {key}={qck[key]!r} != current {cur!r}; retrain Q.")
+
+    rows, fp = ml_data.load_training_rows(args.csv, include_boss=qck["dataset_fingerprint"]["include_boss"],
+                                          expected_extra_subset=bot_runner.policy_extra())
+    if fp["dataset_id"] != qck["dataset_fingerprint"]["dataset_id"]:
+        raise SystemExit(f"dataset {fp['dataset_id']} differs from Q's training dataset "
+                         f"{qck['dataset_fingerprint']['dataset_id']}; pass the same --csv files.")
+    split = qck["split"]
+    tr_rows = ml_data.select(rows, split["train"])
+    va_rows, va_runs = _ordered_runs(ml_data.select(rows, split["val"]))
+
+    cond_scaler = ml_data.Standardizer.from_json(qck["cond_scaler"])
+    out_scaler_json = qck["outcome_scaler"]
+    out_scaler_t = models.OutcomeScaler(out_scaler_json["mean"], out_scaler_json["std"]).to(device)
+    q = models.OutcomeModel(**qck["q_xa_hparams"]).to(device)
+    q.load_state_dict(qck["q_xa_state"])
+    models.freeze(q)
+
+    x_tr = torch.tensor(cond_scaler.transform(ml_data.cond_matrix(tr_rows)), dtype=torch.float32, device=device)
+    a_tr = _actions_n(ml_data.action_matrix(tr_rows), torch, device)
+    x_va = torch.tensor(cond_scaler.transform(ml_data.cond_matrix(va_rows)), dtype=torch.float32, device=device)
+    refs = {
+        "observed": _actions_n(ml_data.action_matrix(va_rows), torch, device),
+        "heuristic": _actions_n([ml_data.heuristic_action_for_row(r) for r in va_rows], torch, device),
+        "fixed": _actions_n([[cfg["controllers"]["fixed"]["action"][k] for k in core.ACTION_KEYS]]
+                            * len(va_rows), torch, device),
+    }
+    # Dequantize the integer spawn dimension of real actions so D cannot
+    # separate real/fake merely by integrality.
+    spawn_half_bin = 0.5 / (ml_data.ACTION_HI[-1] - ml_data.ACTION_LO[-1])
+
+    gen = models.Generator(noise_dim=args.noise_dim, hidden=args.hidden).to(device)
+    disc = models.Discriminator(hidden=args.hidden).to(device)
+    opt_g = torch.optim.Adam(gen.parameters(), lr=args.lr_g, betas=(0.5, 0.999))
+    opt_d = torch.optim.Adam(disc.parameters(), lr=args.lr_d, betas=(0.5, 0.999))
+
+    n = x_tr.shape[0]
+    history = []
+    best = {"score": float("inf"), "epoch": -1}
+    bad = 0
+    for epoch in range(args.epochs):
+        gen.train()
+        disc.train()
+        perm = torch.randperm(n, device=device)
+        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "balance": 0.0, "diversity": 0.0}
+        nb = 0
+        for s in range(0, n, args.batch_size):
+            idx = perm[s:s + args.batch_size]
+            if idx.numel() < 2:
+                continue
+            x_b = x_tr[idx]
+            a_real = a_tr[idx].clone()
+            a_real[:, -1] = (a_real[:, -1] + (torch.rand_like(a_real[:, -1]) * 2 - 1) * spawn_half_bin).clamp(0, 1)
+
+            a_fake = gen(x_b)
+            d_loss = models.discriminator_loss(disc, x_b, a_real, a_fake)
+            opt_d.zero_grad()
+            d_loss.backward()
+            opt_d.step()
+
+            terms = models.generator_loss(gen, disc, q, out_scaler_t, x_b, args.lambda_balance,
+                                          args.lambda_diversity, args.diversity_tau, cfg)
+            opt_g.zero_grad()
+            terms["total"].backward()
+            opt_g.step()
+
+            sums["d"] += d_loss.item()
+            sums["g"] += terms["total"].item()
+            for k in models.GENERATOR_LOSS_TERMS:
+                sums[k] += terms[k].item()
+            nb += 1
+
+        diag = models.generator_diagnostics(gen, q, out_scaler_t, x_va, run_index=va_runs,
+                                            reference_actions_n=refs, k=sel_cfg["diversity_samples"],
+                                            seed=args.seed, exp_cfg=cfg)
+        score = models.selection_score(diag, sel_cfg)
+        rec = {"epoch": epoch, **{f"loss_{k}": v / max(nb, 1) for k, v in sums.items()},
+               "val_score": score, **{f"val_{k}": v for k, v in diag.items()
+                                      if not isinstance(v, dict)},
+               "val_balance_ref": diag["balance_ref"]}
+        history.append(rec)
+        if score < best["score"] - 1e-6:
+            best = {"score": score, "epoch": epoch, "diag": diag,
+                    "gen": copy.deepcopy(gen.state_dict()), "disc": copy.deepcopy(disc.state_dict()),
+                    "opt_g": copy.deepcopy(opt_g.state_dict()), "opt_d": copy.deepcopy(opt_d.state_dict())}
+            bad = 0
+        else:
+            bad += 1
+        if epoch % 10 == 0 or epoch == args.epochs - 1:
+            print(f"epoch {epoch:4d} D {rec['loss_d']:.3f} adv {rec['loss_adv']:.3f} "
+                  f"bal {rec['loss_balance']:.4f} div {rec['loss_diversity']:.4f} | val score {score:.4f} "
+                  f"bal_pred {diag['balance_pred']:.4f} (heur {diag['balance_ref']['heuristic']:.4f}) "
+                  f"div {diag['diversity']:.3f} sens {diag['sensitivity']:.3f}")
+        if bad >= args.patience:
+            print(f"early stop at epoch {epoch} (best {best['epoch']})")
+            break
+
+    gen.load_state_dict(best["gen"])
+    ckpt_id = checkpoint_id_for(best["gen"], torch)
+    ckpt = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_id": ckpt_id,
+        "dataset_schema_version": telemetry.SCHEMA_VERSION,
+        "dda_version": telemetry.DDA_VERSION,
+        "config_hash": fp["config_hash"],
+        "dataset_extra": fp["manifest_extra"],
+        "dataset_fingerprint": fp,
+        "experiment_config_version": cfg["experiment_config_version"],
+        "experiment_config_hash": balance.experiment_config_hash(cfg),
+        "cond_dim": core.COND_DIM, "target_dim": core.ACTION_DIM, "outcome_dim": balance.OUTCOME_DIM,
+        "cond_columns": COND_COLUMNS, "action_columns": ACTION_COLUMNS, "action_keys": core.ACTION_KEYS,
+        "outcome_columns": balance.OUTCOME_COLUMNS,
+        "action_lo": ml_data.ACTION_LO, "action_hi": ml_data.ACTION_HI,
+        "cond_scaler": cond_scaler.to_json(), "outcome_scaler": out_scaler_json,
+        "generator_hparams": gen.hparams, "discriminator_hparams": disc.hparams,
+        "q_hparams": qck["q_xa_hparams"],
+        "generator_state_dict": best["gen"], "discriminator_state_dict": best["disc"],
+        "q_state_dict": qck["q_xa_state"],
+        "optimizer_g_state": best["opt_g"], "optimizer_d_state": best["opt_d"],
+        "epoch": best["epoch"], "best_score": best["score"], "best_diagnostics": best["diag"],
+        "seed": args.seed, "hparams": vars(args), "split": split,
+        "q_gate": gate, "q_gate_overridden": (not gate["passed"]) and args.allow_failed_q_gate,
+        "loss_equation": "L_G = L_adv + lambda_balance*L_balance + lambda_diversity*L_diversity",
+        "history": history,
+    }
+    torch.save(ckpt, ckpt_path)
+    with open(os.path.join(args.out_dir, "scaler.json"), "w") as f:
+        json.dump({"cond_scaler": cond_scaler.to_json(), "outcome_scaler": out_scaler_json,
+                   "action_lo": ml_data.ACTION_LO, "action_hi": ml_data.ACTION_HI}, f, indent=2)
+    with open(os.path.join(args.out_dir, "train_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+    report = {"checkpoint_id": ckpt_id, "best_epoch": best["epoch"], "best_score": best["score"],
+              "best_diagnostics": best["diag"], "q_gate": gate, "hparams": vars(args),
+              "elapsed_sec": round(time.time() - t0, 2), "n_train_rows": len(tr_rows),
+              "n_val_rows": len(va_rows), "dataset_id": fp["dataset_id"]}
+    with open(os.path.join(args.out_dir, "cgan_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+
+    d = best["diag"]
+    print(f"best epoch {best['epoch']} score {best['score']:.4f} checkpoint_id {ckpt_id}")
+    print(f"  validity {d['validity']:.3f} saturation {d['saturation']:.3f} diversity {d['diversity']:.4f} "
+          f"sensitivity {d['sensitivity']:.4f} jitter {d['jitter']:.4f}")
+    print(f"  Q-predicted balance: G {d['balance_pred']:.4f} | "
+          + " ".join(f"{k} {v:.4f}" for k, v in d["balance_ref"].items()))
+    print(f"checkpoint -> {ckpt_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

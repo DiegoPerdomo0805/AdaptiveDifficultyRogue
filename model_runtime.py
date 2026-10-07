@@ -1,145 +1,151 @@
 """
 model_runtime.py
 =================
-Loads a trained cGAN checkpoint for use inside rogue.py, independent of
-the current working directory (loaded via importlib.util.spec_from_file_location
-by the caller, so this module never relies on sys.path/cwd either).
+Loads a trained outcome-guided cGAN checkpoint (train_cgan.py) for use by
+controllers.CGANController (bot_runner.py, evaluate_controllers.py and
+rogue.py), independent of the current working directory.
 
-Finding #9 fix: LoadedModels.load() is the consumer-side guardian that was
-previously missing ("el versionado esta en el productor, pero no en el
-consumidor"). It verifies the checkpoint's recorded cond_dim/target_dim/
-dda_version against the CURRENT code's dda_core.COND_DIM /
-telemetry.TARGET_DIM / telemetry.DDA_VERSION before allowing the model to
-be used at all. A checkpoint trained under an old/incompatible schema is
-rejected with a clear message rather than silently fed a wrong-shaped
-condition vector (which would previously either crash deep inside a
-tensor op or -- worse -- silently produce garbage from misaligned dims).
+LoadedModels.load() is the consumer-side guardian. Before a model may be
+used it verifies, against the CURRENT code and experiment config:
+
+  * checkpoint schema version
+  * telemetry schema version and DDA version
+  * condition / action / outcome dimensions and their EXACT ordered columns
+  * action bounds
+  * config_hash (recomputed from dda_core with the dataset's recorded extra)
+  * experiment config version and hash (balance targets / controllers)
+  * scaler fields (names, lengths, finite, positive std)
+
+Any mismatch raises ModelVersionError; the controller then falls back to the
+heuristic and records the reason. predict() raises InvalidModelOutput for
+non-finite or out-of-bounds outputs (also a recorded fallback).
+
+The checkpoint is loaded with torch.load(weights_only=True): it contains only
+tensors and plain Python containers.
 """
 
 from typing import List, Optional
-import json
+import math
 import os
 import sys
 
-# This module is loaded via importlib.util.spec_from_file_location by
-# rogue.py, specifically so it works regardless of the caller's cwd or
-# sys.path. But it in turn depends on dda_core.py/telemetry.py, which are
-# plain `import x` statements -- those only resolve if this file's own
-# directory is on sys.path. A caller in a different cwd (confirmed by an
-# end-to-end test: loading this module while cwd'd elsewhere raised
-# ModuleNotFoundError: dda_core) would otherwise crash here. Fix: insert
-# this file's own directory at the front of sys.path before importing our
-# siblings, so the same spec_from_file_location trick that isolates THIS
-# module's own loading also isolates what it depends on.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+import balance
 import dda_core as core
+import ml_data
 import telemetry
+
+CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v3"
+CHECKPOINT_FILE = "cgan_checkpoint.pt"
 
 
 class ModelVersionError(Exception):
     pass
 
 
+class InvalidModelOutput(ValueError):
+    pass
+
+
+def verify_checkpoint(ck: dict, exp_cfg: Optional[dict] = None):
+    """Raises ModelVersionError naming the first incompatibility."""
+    exp_cfg = exp_cfg or balance.load_experiment_config()
+
+    def need(key, expected):
+        got = ck.get(key)
+        if got != expected:
+            raise ModelVersionError(
+                f"checkpoint {key}={got!r} does not match the current code's {expected!r}; "
+                f"refusing to load an incompatible model (retrain against the current schema).")
+
+    need("checkpoint_schema_version", CHECKPOINT_SCHEMA_VERSION)
+    need("dataset_schema_version", telemetry.SCHEMA_VERSION)
+    need("dda_version", telemetry.DDA_VERSION)
+    need("cond_dim", core.COND_DIM)
+    need("target_dim", core.ACTION_DIM)
+    need("outcome_dim", balance.OUTCOME_DIM)
+    need("cond_columns", ml_data.COND_COLUMNS)
+    need("action_columns", ml_data.ACTION_COLUMNS)
+    need("action_keys", core.ACTION_KEYS)
+    need("outcome_columns", balance.OUTCOME_COLUMNS)
+    need("action_lo", ml_data.ACTION_LO)
+    need("action_hi", ml_data.ACTION_HI)
+    need("experiment_config_version", exp_cfg["experiment_config_version"])
+    need("experiment_config_hash", balance.experiment_config_hash(exp_cfg))
+    recomputed = core.config_hash(extra=ck.get("dataset_extra") or {})
+    if ck.get("config_hash") != recomputed:
+        raise ModelVersionError(
+            f"checkpoint config_hash={ck.get('config_hash')!r} but the current dda_core constants "
+            f"give {recomputed!r} for the same dataset extra; gameplay/DDA constants changed since "
+            f"training -- refusing to load.")
+    try:
+        ml_data.Standardizer.from_json(ck["cond_scaler"]).check(ml_data.COND_COLUMNS)
+        ml_data.Standardizer.from_json(ck["outcome_scaler"]).check(balance.OUTCOME_COLUMNS[1:])
+    except (KeyError, TypeError, ValueError) as e:
+        raise ModelVersionError(f"invalid scaler in checkpoint: {e}")
+    for key in ("generator_state_dict", "generator_hparams", "checkpoint_id"):
+        if key not in ck:
+            raise ModelVersionError(f"checkpoint is missing {key!r}")
+
+
 class LoadedModels:
-    def __init__(self, generator, scaler: dict, checkpoint: dict):
+    def __init__(self, generator, cond_scaler, checkpoint: dict, q=None, out_scaler=None):
         self.generator = generator
-        self.scaler = scaler
+        self.cond_scaler = cond_scaler
         self.checkpoint = checkpoint
+        self.q = q
+        self.out_scaler = out_scaler
+        self.noise_dim = generator.noise_dim
+        self.checkpoint_id = checkpoint["checkpoint_id"]
 
     @staticmethod
-    def load(model_dir: str) -> "LoadedModels":
+    def load(model_dir: str, load_q: bool = False) -> "LoadedModels":
         import torch
-        import torch.nn as nn
+        import models
 
-        ckpt_path = os.path.join(model_dir, "cgan_checkpoint.pt")
-        scaler_path = os.path.join(model_dir, "scaler.json")
+        ckpt_path = os.path.join(model_dir, CHECKPOINT_FILE)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"No checkpoint at {ckpt_path}")
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"No scaler at {scaler_path}")
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        verify_checkpoint(ck)
 
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        with open(scaler_path) as f:
-            scaler = json.load(f)
-
-        # --- The guardian the review said was missing ----------------------
-        ckpt_cond_dim = checkpoint.get("cond_dim")
-        ckpt_target_dim = checkpoint.get("target_dim")
-        ckpt_dda_version = checkpoint.get("dda_version")
-
-        if ckpt_cond_dim != core.COND_DIM:
-            raise ModelVersionError(
-                f"Checkpoint was trained with cond_dim={ckpt_cond_dim}, but "
-                f"the current code's dda_core.COND_DIM={core.COND_DIM}. "
-                f"Refusing to load an incompatible model -- retrain against "
-                f"the current schema."
-            )
-        if ckpt_target_dim != telemetry.TARGET_DIM:
-            raise ModelVersionError(
-                f"Checkpoint target_dim={ckpt_target_dim} != current "
-                f"telemetry.TARGET_DIM={telemetry.TARGET_DIM}."
-            )
-        if ckpt_dda_version != telemetry.DDA_VERSION:
-            raise ModelVersionError(
-                f"Checkpoint was trained against dda_version="
-                f"{ckpt_dda_version!r}, but the running code is "
-                f"{telemetry.DDA_VERSION!r}. The heuristic/config semantics "
-                f"may have changed since this model was trained -- refusing "
-                f"to load."
-            )
-
-        class Generator(nn.Module):
-            def __init__(self, cond_dim, noise_dim=8, target_dim=4, hidden=64):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Linear(cond_dim + noise_dim, hidden), nn.ReLU(),
-                    nn.Linear(hidden, hidden), nn.ReLU(),
-                    nn.Linear(hidden, target_dim),
-                )
-                self.noise_dim = noise_dim
-
-            def forward(self, cond, noise=None):
-                if noise is None:
-                    noise = torch.randn(cond.shape[0], self.noise_dim, device=cond.device)
-                x = torch.cat([cond, noise], dim=1)
-                return self.net(x)
-
-        gen = Generator(cond_dim=ckpt_cond_dim, target_dim=ckpt_target_dim)
-        gen.load_state_dict(checkpoint["generator_state_dict"])
+        gen = models.Generator(**ck["generator_hparams"])
+        gen.load_state_dict(ck["generator_state_dict"])
         gen.eval()
+        q = out_scaler = None
+        if load_q:
+            q = models.OutcomeModel(**ck["q_hparams"])
+            q.load_state_dict(ck["q_state_dict"])
+            models.freeze(q)
+            out_scaler = models.OutcomeScaler(ck["outcome_scaler"]["mean"], ck["outcome_scaler"]["std"])
+        return LoadedModels(gen, ml_data.Standardizer.from_json(ck["cond_scaler"]), ck, q, out_scaler)
 
-        return LoadedModels(generator=gen, scaler=scaler, checkpoint=checkpoint)
-
-    def predict(self, cond_vec: List[float]) -> dict:
+    def predict(self, cond_vec: List[float], noise: Optional[List[float]] = None) -> dict:
+        """One bounded, finite action for one condition vector. Raises
+        ModelVersionError for a wrong-shaped/non-finite input and
+        InvalidModelOutput for a non-finite/out-of-bounds output."""
         import torch
         if len(cond_vec) != core.COND_DIM:
             raise ModelVersionError(
-                f"predict() called with a {len(cond_vec)}-dim condition "
-                f"vector, expected {core.COND_DIM}."
-            )
+                f"predict() called with a {len(cond_vec)}-dim condition vector, expected {core.COND_DIM}.")
+        if not all(math.isfinite(float(v)) for v in cond_vec):
+            raise ModelVersionError("predict() called with a non-finite condition vector")
+        x = torch.tensor(self.cond_scaler.transform([list(map(float, cond_vec))]), dtype=torch.float32)
+        z = None
+        if noise is not None:
+            if len(noise) != self.noise_dim:
+                raise ModelVersionError(f"noise has {len(noise)} dims, expected {self.noise_dim}")
+            z = torch.tensor([noise], dtype=torch.float32)
         with torch.no_grad():
-            cond_t = torch.tensor([cond_vec], dtype=torch.float32)
-            scaled_out = self.generator(cond_t)[0].tolist()
-
-        mean = self.scaler["target_mean"]
-        std = self.scaler["target_std"]
-        raw = [scaled_out[i] * std[i] + mean[i] for i in range(len(scaled_out))]
-        cols = self.scaler["target_columns"]
-        result = dict(zip([c.replace("applied_", "") for c in cols], raw))
-
-        # Clamp into the same bounds rule_based_dda() itself respects, so a
-        # model prediction can never produce an out-of-design-space value.
-        result["hp_mult"] = core.clamp(result["hp_mult"], *core.DDA_HP_MULT_BOUNDS)
-        result["dmg_mult"] = core.clamp(result["dmg_mult"], *core.DDA_DMG_MULT_BOUNDS)
-        result["speed_mult"] = core.clamp(result["speed_mult"], *core.DDA_SPEED_MULT_BOUNDS)
-        result["spawn_count"] = int(round(core.clamp(
-            result["spawn_count"], *core.DDA_SPAWN_BOUNDS)))
-        return {
-            "enemy_hp_mult": round(result["hp_mult"], 3),
-            "enemy_dmg_mult": round(result["dmg_mult"], 3),
-            "enemy_speed_mult": round(result["speed_mult"], 3),
-            "spawn_count": result["spawn_count"],
-        }
+            a_n = self.generator(x, z)[0].tolist()
+        raw = ml_data.denormalize_action(a_n)
+        if not all(math.isfinite(v) for v in raw):
+            raise InvalidModelOutput(f"non-finite generator output {raw}")
+        for i, k in enumerate(core.ACTION_KEYS):
+            lo, hi = core.ACTION_BOUNDS[k]
+            if not (lo - 1e-6 <= raw[i] <= hi + 1e-6):
+                raise InvalidModelOutput(f"{k}={raw[i]} outside design bounds [{lo}, {hi}]")
+        return core.finalize_action(dict(zip(core.ACTION_KEYS, raw)))
