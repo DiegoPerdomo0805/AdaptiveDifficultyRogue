@@ -28,12 +28,11 @@ def _row(**kw):
 
 def test_outcome_vector_definitions_and_edge_cases():
     y = balance.outcome_vector(_row())
-    assert y == pytest.approx([0.0, 0.6, 0.2, 0.3, 0.2])
-    # zero damage dealt and taken -> deterministic 0
+    assert y == pytest.approx([0.0, 0.6, 20.0 / 120.0, 0.3, 0.2])
+    # zero damage dealt and taken -> deterministic 0; zero dealt -> 1; bounded
     assert balance.outcome_vector(_row(damage_taken_in_room=0.0, damage_dealt_in_room=0.0))[2] == 0.0
-    # zero dealt, some taken -> taken / D_min, capped
-    assert balance.outcome_vector(_row(damage_taken_in_room=3.0, damage_dealt_in_room=0.0))[2] == 3.0
-    assert balance.outcome_vector(_row(damage_taken_in_room=99.0, damage_dealt_in_room=0.0))[2] == 5.0
+    assert balance.outcome_vector(_row(damage_taken_in_room=3.0, damage_dealt_in_room=0.0))[2] == 1.0
+    assert balance.outcome_vector(_row(damage_taken_in_room=0.0, damage_dealt_in_room=50.0))[2] == 0.0
     # zero hits -> efficiency 0; death forces post hp 0
     assert balance.outcome_vector(_row(melee_hits_in_room=0, magic_hits_in_room=0,
                                        melee_kills_in_room=0, magic_kills_in_room=0))[3] == 0.0

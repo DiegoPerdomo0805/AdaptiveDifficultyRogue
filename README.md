@@ -51,7 +51,7 @@ L_G = L_adv + lambda_balance * L_balance + lambda_diversity * L_diversity
 |---|---|
 | `death` | `died_in_room` (Q predicts a logit; balance uses the probability) |
 | `post_hp_ratio` | player HP / max HP after the room (0 on death) |
-| `dmg_ratio` | `damage_taken / max(damage_dealt, 1.0)`, clamped to [0, 5] (0 when nothing was taken) |
+| `damage_share` | `damage_taken / (damage_taken + damage_dealt)` in [0, 1] (0 when both are 0); a bounded monotone transform r/(1+r) of the taken/dealt ratio |
 | `combat_efficiency` | `kills / max(hits, 1)`, 0 when no hit landed |
 | `duration_norm` | `time_in_room / 30 s`, clamped to [0, 2] |
 

@@ -1,5 +1,5 @@
 {
-  "experiment_config_version": "exp_v1.0-pilot",
+  "experiment_config_version": "exp_v1.1-pilot",
   "status": "PILOT_PLACEHOLDER: balance targets are provisional and MUST be calibrated from the Stage A pilot (python balance.py calibrate ...), then frozen by changing status to FROZEN and bumping experiment_config_version before the principal collection.",
 
   "controllers": {
@@ -29,9 +29,7 @@
   },
 
   "outcomes": {
-    "columns": ["death", "post_hp_ratio", "dmg_ratio", "combat_efficiency", "duration_norm"],
-    "dmg_ratio_min_dealt": 1.0,
-    "dmg_ratio_cap": 5.0,
+    "columns": ["death", "post_hp_ratio", "damage_share", "combat_efficiency", "duration_norm"],
     "duration_norm_seconds": 30.0,
     "duration_norm_cap": 2.0
   },
@@ -39,13 +37,13 @@
   "balance_targets": {
     "death":             {"low": 0.0,  "high": 0.08, "scale": 0.10, "weight": 3.0},
     "post_hp_ratio":     {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
-    "dmg_ratio":         {"low": 0.10, "high": 0.45, "scale": 0.20, "weight": 1.0},
+    "damage_share":      {"low": 0.09, "high": 0.31, "scale": 0.12, "weight": 1.0},
     "combat_efficiency": {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
     "duration_norm":     {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
   },
 
   "q_gate": {
-    "key_continuous_outputs": ["post_hp_ratio", "dmg_ratio"],
+    "key_continuous_outputs": ["post_hp_ratio", "damage_share"],
     "min_r2_vs_mean": 0.0,
     "require_death_brier_below_prevalence": true,
     "min_action_gain_rel": 0.02

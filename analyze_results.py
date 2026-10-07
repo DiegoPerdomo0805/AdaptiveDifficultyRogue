@@ -77,7 +77,7 @@ def run_summary(rr: List[dict], cfg) -> dict:
 
 RUN_METRICS = ["victory", "died", "boss_reached", "combat_rooms", "final_progress"]
 PAIRED_METRICS = ["run_victory", "run_died", "run_combat_rooms", "room_mean_balance_distance",
-                  "room_mean_post_hp_ratio", "room_mean_death", "room_mean_dmg_ratio",
+                  "room_mean_post_hp_ratio", "room_mean_death", "room_mean_damage_share",
                   "room_mean_duration_norm"]
 
 

@@ -14,7 +14,7 @@ Conventions
 * Actions inside the networks are normalized to [0, 1]^4 over
   dda_core.ACTION_BOUNDS (ml_data.normalize_action); G emits sigmoid outputs
   so every generated action is inside the design bounds.
-* Q predicts [death_logit, post_hp_ratio, dmg_ratio, combat_efficiency,
+* Q predicts [death_logit, post_hp_ratio, damage_share, combat_efficiency,
   duration_norm] where the 4 continuous outputs are standardized with the
   TRAIN-split outcome scaler. `outcomes_physical()` converts to the units
   used by balance.py (death as a probability).

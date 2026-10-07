@@ -14,9 +14,11 @@ Outcome vector (OUTCOME_COLUMNS, order is part of the checkpoint contract):
   death              died_in_room in {0, 1}. Q predicts a logit; the balance
                      loss sees the probability sigmoid(logit).
   post_hp_ratio      player hp / max hp right after the room (0 on death).
-  dmg_ratio          damage_taken_in_room / max(damage_dealt_in_room, D_min),
-                     clamped to [0, dmg_ratio_cap]. D_min (default 1.0)
-                     makes zero-damage rooms deterministic: 0 taken -> 0.
+  damage_share       damage_taken / (damage_taken + damage_dealt) in [0, 1]
+                     (0 when both are 0). A bounded, monotone transform of the
+                     taken/dealt ratio r: share = r / (1 + r). exp_v1.0 used
+                     taken / max(dealt, 1) capped at 5, whose heavy tail (death
+                     before dealing damage) dominated Q's MSE and test R^2.
   combat_efficiency  kills_in_room / max(hits_in_room, 1) in [0, 1];
                      0 when no hit landed.
   duration_norm      time_in_room / duration_norm_seconds, clamped to
@@ -43,7 +45,7 @@ import sys
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(_THIS_DIR, "experiment_config.json")
 
-OUTCOME_COLUMNS = ["death", "post_hp_ratio", "dmg_ratio", "combat_efficiency", "duration_norm"]
+OUTCOME_COLUMNS = ["death", "post_hp_ratio", "damage_share", "combat_efficiency", "duration_norm"]
 OUTCOME_DIM = len(OUTCOME_COLUMNS)
 BINARY_OUTCOMES = ["death"]
 
@@ -117,13 +119,13 @@ def outcome_vector(row, cfg: Optional[dict] = None) -> List[float]:
     post_hp = 0.0 if died else min(max(_f(row, "post_hp_ratio"), 0.0), 1.0)
     taken = max(_f(row, "damage_taken_in_room"), 0.0)
     dealt = max(_f(row, "damage_dealt_in_room"), 0.0)
-    dmg_ratio = min(taken / max(dealt, oc["dmg_ratio_min_dealt"]), oc["dmg_ratio_cap"])
+    damage_share = taken / (taken + dealt) if (taken + dealt) > 0 else 0.0
     kills = _f(row, "melee_kills_in_room") + _f(row, "magic_kills_in_room")
     hits = _f(row, "melee_hits_in_room") + _f(row, "magic_hits_in_room")
     efficiency = min(kills / hits, 1.0) if hits > 0 else 0.0
     duration = min(max(_f(row, "time_in_room"), 0.0) / oc["duration_norm_seconds"],
                    oc["duration_norm_cap"])
-    return [died, post_hp, dmg_ratio, efficiency, duration]
+    return [died, post_hp, damage_share, efficiency, duration]
 
 
 # ---------------------------------------------------------------------------
