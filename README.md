@@ -1,13 +1,24 @@
-# Adaptive Difficulty Rogue: outcome-guided cGAN vs. heuristic DDA
+# Adaptive Difficulty Rogue: outcome-guided DDA vs. heuristic
 
 A pygame top-down roguelike used as a testbed for **dynamic difficulty adjustment (DDA)**.
-Before each room, a controller picks the enemy intervention
 
-```text
-a = [enemy_hp_multiplier, enemy_damage_multiplier, enemy_speed_multiplier, spawn_count]
-```
+## Frozen project scope
 
-from the 9-dimensional pre-room condition vector
+**Included**
+- Outcome-guided adaptation of enemy HP, damage, speed and spawn count.
+- Outcome-guided adaptation of the **loot category** (weapon, spell, armor, boots).
+- Fixed item definitions and fixed item statistics.
+- Evaluating a selected reward over the **next three combat rooms** (or until the run ends).
+- A **shared deterministic boss policy** used by every experimental controller.
+
+**Excluded**
+- Literal enemy-size or hitbox adaptation.
+- Learned modification or generation of individual item statistics.
+- New item categories or additional gameplay systems.
+
+## Decisions and their inputs
+
+Before each room the game builds the 9-dimensional pre-room condition
 
 ```text
 x = [melee_ratio, magic_ratio, hits_per_kill_melee, hits_per_kill_magic,
@@ -15,150 +26,195 @@ x = [melee_ratio, magic_ratio, hits_per_kill_melee, hits_per_kill_magic,
      node_depth_normalized, run_progress_normalized]
 ```
 
-The experiment compares three controllers under equivalent seeds and maps: **fixed**
-difficulty, the rule-based **heuristic**, and an **outcome-guided cGAN**.
+Then one of two things happens:
 
-## How the cGAN learns from outcomes (not from the heuristic)
+* **Ordinary combat room:** the run's enemy controller chooses `a = [hp_mult, dmg_mult, speed_mult, spawn_count]`.
+* **Loot room:** the run's reward policy proposes category probabilities `[P_weapon, P_spell, P_armor, P_boots]`.
+  Three offers are drawn from them, each an item drawn uniformly from the category's fixed pool. The bot or the
+  human then selects one offer, and it is equipped.
+
+Boss rooms always use `experiment_config.shared_boss`, and telemetry marks them `controller_type = shared_boss`.
+Enemy-free rooms log a placeholder action. No enemy model is called in boss rooms or enemy-free rooms.
+
+| controller (`--enemy-controller`) | role |
+|---|---|
+| `fixed` | constant reference action, no adaptation (baseline) |
+| `heuristic` | `rule_based_dda` (baseline, exploration anchor, runtime fallback; **never a label**) |
+| `exploration` | seeded bounded variation for data collection: perturb / uniform / reference |
+| `cgan` | outcome-guided generator with a logged heuristic fallback |
+
+| reward policy (`--reward-policy`) | role |
+|---|---|
+| `fixed_uniform` | equal category probabilities |
+| `heuristic` | documented category preference (`dda_core.loot_bias_for_metrics`) |
+| `exploration` | seeded category coverage for data collection: focus / uniform / heuristic |
+| `learned_loot` | `G_loot`. It is trained **only if the Q_loot gate passes**; otherwise it falls back (logged) |
+
+## Outcome-guided learning (not imitation)
 
 ```text
-Q(x, a) -> o      outcome evaluator, trained ONLY on observed (x, a, o) tuples
-G(x, z) -> a      generator, bounded in the design action box by construction
-D(x, a) -> logit  discriminator: observed vs. generated (x, a) pairs
+Enemy:  Q(x, a) -> o        trained only on observed (x, a, o); bounded outputs
+        G(x, z) -> a        inside the observed action-support box
+        D(x, a) -> logit    observed vs. generated
+        L_G = L_adv + λ_bal·L_balance(Q_frozen(x,G)) + λ_div·L_div + λ_sup·L_support
 
-L_G = L_adv + lambda_balance * L_balance + lambda_diversity * L_diversity
-  L_adv       = BCE(D(x, G(x,z1)), 1)                       stay in the observed safe action support
-  L_balance   = balance_loss(Q_frozen(x, G(x,z1)))          move predicted outcomes into target intervals
-  L_diversity = mean(relu(tau - |G(x,z1)-G(x,z2)|_1 / |z1-z2|_1))   penalize noise collapse
+Loot:   Q_loot(x, c, item, prior_equipment) -> next-3-combat-room outcome profile
+        G_loot(x, prior_equipment, z) -> category probabilities (floor + support mask)
+        L = E[Σ_c p_c · U_c] − λ_ent·H(p) + λ_div·L_div        (U_c = Q_loot horizon balance loss)
 ```
 
-* Training data mixes **exploration** (seeded, bounded perturbations around the heuristic,
-  uniform samples, reference actions), **heuristic** and **fixed** actions, so action effects on
-  outcomes are identifiable.
-* The heuristic is a baseline, one data-collection policy, an exploration anchor and the runtime
-  fallback. **It is never a label.** `train_cgan.py` has no reconstruction loss and no warm-up.
-* `train_q.py` also trains the state-only ablation **Q(x)**. The *Q gate* allows cGAN training
-  only if Q(x,a) beats the constant-mean / prevalence baselines on held-out runs **and** beats Q(x)
-  by `q_gate.min_action_gain_rel`. If it doesn't, the data lacks evidence that interventions matter.
-* The generator checkpoint is selected by a composite validation score (validity, Q-predicted
-  balance distance, diversity, conditional sensitivity, temporal jitter), never by GAN loss.
-* Bot archetype names (`player_profile`) are stratification metadata only. They are never a
-  model input.
-* **Reward/loot adaptation is not learned.** Every controller uses the heuristic loot bias.
+* Q outputs are **bounded by architecture**. The binary outcome is a logit; continuous outcomes are
+  `lo + (hi − lo)·sigmoid`, so predictions can never leave their physical range.
+* **Action-support / OOD protection for G.** Outputs are confined to the observed action-quantile box.
+  A kNN support penalty applies beyond the 95th-percentile training distance. The runtime guard rejects
+  actions beyond 1.5× that threshold and falls back to the heuristic, logged as `ood_action`.
+* **Gates.**
+  * `train_q.py`: Q(x,a) must beat the naive baselines and the state-only Q(x).
+  * `train_q_loot.py`: a reward-aware Q_loot must beat its **information-matched** state-only twin
+    (`x+c` vs `x`, `x+c+item+prior` vs `x+prior`). That means a mean gain ≥ `min_reward_gain_rel`
+    with a positive gain on **every** grouped split. If the loot gate fails, `learned_loot` is not
+    trained, and only the descriptive loot analysis is reported.
+* Model selection uses validation diagnostics: validity, Q-predicted balance, OOD rate, diversity,
+  sensitivity and jitter, with eligibility rules. It never uses GAN loss.
+* Archetype names (`player_profile`) are stratification metadata only. They are never a model input.
 
-### Observed outcome vector (`balance.py`)
+### Outcomes (`balance.py`)
+
+Enemy outcomes, per ordinary combat room:
 
 | outcome | definition |
 |---|---|
-| `death` | `died_in_room` (Q predicts a logit; balance uses the probability) |
-| `post_hp_ratio` | player HP / max HP after the room (0 on death) |
-| `damage_share` | `damage_taken / (damage_taken + damage_dealt)` in [0, 1] (0 when both are 0); a bounded monotone transform r/(1+r) of the taken/dealt ratio |
-| `combat_efficiency` | `kills / max(hits, 1)`, 0 when no hit landed |
-| `duration_norm` | `time_in_room / 30 s`, clamped to [0, 2] |
+| `death` | died in the room |
+| `post_hp_ratio` | HP after the room (0 on death) |
+| `damage_share` | taken / (taken + dealt) |
+| `combat_efficiency` | kills / max(hits, 1) |
+| `duration_norm` | time / 30 s, capped at 2 |
 
-Balance loss: `sum_i w_i * (d_i / s_i)^2 / sum_i w_i` with
-`d_i = max(low_i - y_i, 0) + max(y_i - high_i, 0)`. It is zero inside every interval and smooth
-outside. Intervals, scales and weights live in `experiment_config.json`.
-**The current values are PILOT placeholders.** Calibrate them from Stage A, then set
-`status` to `FROZEN` and bump `experiment_config_version` before the principal collection.
+Loot horizon (`loot_dataset.py`): the **next 3 combat rooms** after a loot event in the same run.
+Non-combat rooms never count. The horizon stops early at death, at victory, or when the run's log ends.
+
+| loot outcome | definition |
+|---|---|
+| `death_within` | died within the horizon |
+| `end_hp_ratio` | HP after the last observed room |
+| `damage_share` | as above, over the horizon |
+| `combat_efficiency` | as above, over the horizon |
+| `duration_norm_per_room` | mean per-room duration |
+
+The derived CSV also records progress gained, boss reached, incomplete horizon and termination reason.
+Balance loss = `Σ wᵢ(dᵢ/sᵢ)² / Σ wᵢ`, which is zero inside each target interval. Targets live in
+`experiment_config.json` (`enemy_balance_targets`, `loot_horizon_balance_targets`).
+**The status is PILOT.** `balance.py calibrate` proposes intervals by a pre-specified, controller-agnostic
+rule (pooled q25–q75). Review them, set status to FROZEN, and bump the version before the principal collection.
+
+## Equipment audit (human game vs. bot)
+
+| category | items: fixed stats | human equips by | affects combat in the game | bot (v3) |
+|---|---|---|---|---|
+| weapon | Sword dmg 14, cd 1.00, heal 1.00; Hatchet 20, 1.12, 1.05; Rapier 10, 0.80, 0.95 | loot UI (E at pedestal, arrows, Enter) | dmg per melee hit; melee cooldown `0.45·cd`; heal on kill `int(8·heal_mult)` | same dmg; exchange time `0.35 s·cd`; same heal (shared function) |
+| spell | Magic Bolt dmg 10, cd 1.00, ammo 12; Magic Spike 8, 0.78, 16; Hex Bomb 30, 1.25, 9 | loot UI (ammo refilled on pick) | projectile dmg; magic cooldown `0.60·cd`; ammo per room (refilled on entry) | same dmg; exchange time `0.35 s·cd`; ammo per room, melee once empty |
+| armor | Cloth Wrap absorb 0.5, heal +0; Chain Shirt 2.0, +0; Blood Harness 1.0, +6 | loot UI | flat absorb per hit before the defend multiplier; heal bonus on kill | identical (`dda_core.incoming_damage`, `heal_on_kill_amount`) |
+| boots | Leather 1.00; Sprint Greaves 1.25; Voidstep Treads 1.45 (`dash_dist_mult`) | loot UI | **none**: `dash_dist_mult` is only displayed; the dash is always `DASH_SPEED·DASH_TIME` | **inert** (no bot-only meaning) |
+
+Both the game and the bot call the same `dda_core` item functions. The starting loadout is one
+uniform item per slot, derived from `run_seed` in both.
+
+The bot's abstract resolver uses these documented approximations:
+- One enemy engages at a time.
+- Melee hits a single target.
+- A cooldown scales the exchange duration and the enemy's per-exchange hit chance.
+- Hit and damage variation is ±15%.
+
+`tests/test_equipment.py` checks that representative items change the corresponding bot variables,
+and that boots do not.
 
 ## Active pipeline
 
 | file | role |
 |---|---|
-| `dda_core.py` | gameplay constants, condition vector, `rule_based_dda`, action bounds + `finalize_action`, boss modifiers, `config_hash` |
-| `telemetry.py` | `RoomSample` schema (`room_samples_v3.0`), condition/sample builders, manifests, validation |
-| `balance.py` + `experiment_config.json` | versioned controllers / outcomes / balance targets / gates / seed blocks; calibration report |
-| `controllers.py` | `fixed`, `heuristic`, `exploration`, `cgan` (with recorded heuristic fallback) |
-| `bot_runner.py` | **authoritative** headless data generator (DFS backtracking, abstract combat) |
-| `ml_data.py` | validated loading, grouped train/val/test split by `run_id`, scalers |
-| `models.py` | Q, G, D, losses, generator diagnostics, selection score |
-| `train_q.py` | Q(x,a) + Q(x) ablation, per-output metrics, Q gate |
-| `train_cgan.py` | **authoritative** outcome-guided cGAN trainer |
-| `model_runtime.py` | checkpoint compatibility checks + bounded inference |
-| `evaluate_controllers.py` / `analyze_results.py` | equivalent-seed comparison, CIs, tables, plots |
-| `dataset_tools.py` | coverage / duplicate / range statistics with stop flags; safe merge |
-| `rogue.py` | the game (`ROGUE_CONTROLLER=fixed|heuristic|cgan`); human telemetry uses the same contract |
-| `scripts/0*.sh` | resumable stage wrappers (below) |
+| `dda_core.py` | constants, items/equipment and item effects, condition vector, `rule_based_dda`, action bounds, boss modifiers, `config_hash` |
+| `telemetry.py` | `RoomSample` schema `room_samples_v4.0` (incl. loot events), manifests, validation |
+| `balance.py` + `experiment_config.json` | versioned controllers, reward policies, shared boss, targets, support limits, gates, calibration |
+| `controllers.py` / `rewards.py` | enemy controllers + shared boss dispatch / reward policies |
+| `bot_runner.py` | **authoritative** headless generator (`--enemy-controller`, `--reward-policy`, mixtures) |
+| `loot_dataset.py` | deterministic next-3-combat-room loot dataset + manifest (room telemetry stays authoritative) |
+| `ml_data.py`, `models.py` | data plumbing; Q / G / D / support / Q_loot / G_loot |
+| `train_q.py`, `train_cgan.py` | enemy Q gate and outcome-guided cGAN |
+| `train_q_loot.py`, `train_loot_policy.py` | Q_loot ablations + gate, gated learned-loot policy |
+| `model_runtime.py` | compatibility checks, bounded inference, OOD guard, loot loaders |
+| `evaluate_controllers.py` | equivalent-seed evaluation, `--axis enemy` or `--axis reward` |
+| `analyze_results.py`, `analyze_loot.py`, `dataset_tools.py` | comparisons (ordinary / boss-only / end-to-end), descriptive loot analysis, coverage stats |
+| `rogue.py` | the game (`ROGUE_CONTROLLER`, `ROGUE_REWARD_POLICY`); human telemetry uses the same contract |
 
-**Legacy, do not use:** `cGAN.py`, `dummy.py`, `DATA_AUGMENTATION/` (these fail fast;
-`ROGUE_ALLOW_LEGACY=1` overrides), `cgan_training_phased.ipynb`, `runs.csv`, `logs.txt`.
-The `human_sessions/*.csv` files were recorded under schema `room_samples_v2.1` and are rejected
-by the current validator. Record new sessions for analysis.
+**Legacy (do not use):** `cGAN.py`, `dummy.py`, `DATA_AUGMENTATION/` (these fail fast),
+`cgan_training_phased.ipynb`, `runs.csv`, `logs.txt`. The `human_sessions/*.csv` files use
+schema v2.1 and are rejected; record new sessions.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt   # pygame, torch, numpy, matplotlib, pytest
-# CPU-only torch: python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
 pytest -q
 ```
 
 ## Running
 
-### Stage wrappers (recommended)
-
-Each stage writes `EXP/<stage>/` with `meta.json` (git HEAD, versions, config hashes),
-`log.txt` and a `DONE` marker that is written only after validation. A completed stage is
-skipped on re-run. A partial stage directory is refused until you move it aside.
-
 ```bash
 EXP=experiments/$(date +%Y%m%d)_main
-scripts/01_smoke.sh $EXP          # compile, pytest, --help, pilot per controller, stats, calibration report
-#   -> edit experiment_config.json targets, status FROZEN, bump version, commit
-scripts/02_collect.sh $EXP        # seed-block collection (default 9000 runs ~ 30k combat rooms), validate, merge
-scripts/03_train_q.sh $EXP        # Q(x,a) + Q(x) for Q_SEEDS; stops if any gate fails
-scripts/04_train_cgan.sh $EXP     # bounded sweep (SEEDS x BATCHES x LAMBDAs), composite-score selection
-scripts/05_evaluate.sh $EXP       # fixed / heuristic / cgan on reserved evaluation seeds
-scripts/06_analyze.sh $EXP        # thesis bundle: summary.md/json, CSV tables, plots, reports, metas
+scripts/01_smoke.sh $EXP          # compile, pytest, pilot (3 controllers × exploration rewards), loot dataset, calibration
+#   -> set enemy/loot targets from the review, status FROZEN, bump version, commit
+scripts/02_collect.sh $EXP        # seed blocks: MIX (enemy) × REWARD_MIX (reward) -> train_data.csv + train_loot.csv
+scripts/03_train_q.sh $EXP        # Q_enemy seeds (must pass) + Q_loot ablations/gate (result recorded)
+scripts/04_train_cgan.sh $EXP     # cGAN sweep; learned_loot only if the loot gate passed
+scripts/05_evaluate.sh $EXP       # enemy axis (fixed/heuristic/cgan) and reward axis (fixed_uniform/heuristic[/learned_loot])
+scripts/06_analyze.sh $EXP        # results bundle
 ```
 
-Environment knobs are documented at the top of each script (`RUNS`, `MIX`, `WORKERS`,
-`Q_SEEDS`, `SEEDS`, `BATCHES`, `LAMBDA_BALANCE`, `LAMBDA_DIVERSITY`, `EPOCHS`, `DEVICE`,
-`EVAL_RUNS`, ...). For long remote jobs, run them inside `tmux` and set `PYTHON` if needed.
-
-### Individual commands
+Individual tools:
 
 ```bash
-python bot_runner.py --controller exploration --runs 50 --seed 100000 --out pilot.csv --validate
-python bot_runner.py --controller "exploration=0.65,heuristic=0.20,fixed=0.15" --runs 9000 \
-    --seed 1000000 --workers 6 --out train.csv --validate
-python dataset_tools.py stats --csv train.csv --project-rooms 30000
-python balance.py calibrate --csv train.csv
+python bot_runner.py --enemy-controller "exploration=0.65,heuristic=0.20,fixed=0.15" \
+    --reward-policy "exploration=0.60,heuristic=0.20,fixed_uniform=0.20" --runs 9000 --seed 1000000 \
+    --workers 6 --out train.csv --validate
+python loot_dataset.py --csv train.csv --out train_loot.csv
+python balance.py calibrate --csv train.csv --loot-csv train_loot.csv
 python train_q.py --csv train.csv --out-dir q_out
 python train_cgan.py --csv train.csv --q-dir q_out --out-dir model_out
-python evaluate_controllers.py --controllers fixed,heuristic,cgan --model-dir model_out \
-    --runs 300 --seed 9000000 --workers 6 --out-dir experiments/eval --train-csv train.csv --plots
-python analyze_results.py --eval-dir experiments/eval --plots
+python train_q_loot.py --loot-csv train_loot.csv --out-dir q_loot_out
+python train_loot_policy.py --loot-csv train_loot.csv --q-loot-dir q_loot_out --out-dir loot_model_out   # refuses unless gate passed
+python analyze_loot.py --loot-csv train_loot.csv --q-loot-dir q_loot_out --out-dir loot_results
+python evaluate_controllers.py --axis enemy --controllers fixed,heuristic,cgan --model-dir model_out \
+    --runs 300 --seed 9000000 --out-dir experiments/eval_enemy --train-csv train.csv --plots
+python evaluate_controllers.py --axis reward --reward-policies fixed_uniform,heuristic --q-loot-dir q_loot_out \
+    --runs 300 --seed 9000000 --out-dir experiments/eval_reward --train-csv train.csv --plots
 
-ROGUE_CONTROLLER=cgan ROGUE_MODEL_DIR=model_out python rogue.py   # play against the model
+ROGUE_CONTROLLER=cgan ROGUE_MODEL_DIR=model_out ROGUE_REWARD_POLICY=heuristic python rogue.py
 ```
 
-Run `i` of a collection uses `run_seed = --seed + i`. The map, bot archetype, combat RNG and
-controller RNG are independent streams derived from `run_seed`, so results do not depend on
-`--workers`, and the same seed range under two controllers gives paired runs. Seed blocks for
-pilot, training and evaluation are reserved in `experiment_config.json`. `evaluate_controllers.py`
-refuses evaluation seeds that overlap a training manifest.
+Run `i` uses `run_seed = --seed + i`. The map, archetype, starting loadout, combat, loot and policy RNGs
+are independent streams derived from it. Results therefore don't depend on `--workers`, and equal seeds
+are paired across conditions.
 
 ## Versioning contract
 
-* Changing any tunable in `dda_core.py`, the bot policy constants or `experiment_config.json`
-  changes the manifest hashes. `validate_dataset()` rejects datasets that don't match the
-  current code. Regenerate data instead of weakening validation.
-* Changing the condition vector, actions, outcomes or columns requires bumping
-  `telemetry.SCHEMA_VERSION` (and `DDA_VERSION` if heuristic semantics change) and retraining.
-* `model_runtime.py` refuses checkpoints whose schema/DDA/experiment-config versions, dimensions,
-  ordered columns, action bounds, recomputed `config_hash` or scalers differ from the current code.
-  The cGAN controller then falls back to the heuristic and logs `fallback_used` / `fallback_reason`
-  on every affected row. After `max_invalid_outputs` invalid outputs, the model is disabled.
+* Changing any `dda_core` tunable (including item stats), the bot policy constants or
+  `experiment_config.json` changes the manifest hashes. Old datasets and checkpoints are rejected;
+  regenerate them instead of weakening validation.
+* Changing the condition vector, actions, outcomes or columns requires bumping `telemetry.SCHEMA_VERSION`.
+* `model_runtime.py` rejects any checkpoint whose schema, versions, dimensions, ordered columns, action
+  bounds, recomputed `config_hash`, experiment-config hash, scalers or support state differ from the
+  current code. Every fallback is logged per row (`fallback_reason`, `reward_fallback_reason`).
 
 ## Known limitations
 
-* The bot resolves combat abstractly (no pygame) and does not equip looted items. Results
-  describe the bot environment. Human sessions are analyzed separately (`--source human`).
-* Boss rooms are excluded from Q/G training by default. At runtime every controller proposes a
-  raw action for boss rooms too, and the boss modifiers are applied on top.
-* `node_depth_norm` saturates at depth 10 and `total_kills_norm` at 30 kills.
-* Q-predicted balance is a model estimate. Thesis claims must rest on the observed outcomes
-  from `evaluate_controllers.py`.
+* Bot combat is an abstract resolver. Results describe the bot environment; human sessions are
+  analyzed separately.
+* Boots have no functional effect in the game itself, so a learned reward policy can only learn
+  that boots are a weak reward.
+* `node_depth_norm` saturates at depth 10, and `total_kills_norm` at 30 kills.
+* Q-predicted balance and utility are model estimates. Claims must rest on observed outcomes
+  from equivalent-seed evaluation.
+* Loot results from logged data are **descriptive associations**. Only the reward-axis evaluation
+  compares reward policies under controlled conditions.
