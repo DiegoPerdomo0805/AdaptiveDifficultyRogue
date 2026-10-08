@@ -32,6 +32,6 @@ matplotlib==3.11.2
 pytest==9.1.1
 
 # NOT included (legacy / exploratory only — do not use for the final experiment):
-#   cGAN.py, dummy.py, DATA_AUGMENTATION/   -> pandas
-#   cgan_training_phased.ipynb              -> pandas, matplotlib, scikit-learn
+#   legacy/cGAN.py, legacy/dummy.py, legacy/data_augmentation/   -> pandas
+#   notebooks/cgan_training_phased.ipynb                         -> pandas, matplotlib, scikit-learn
 # Install those manually only if you must reopen the legacy material.

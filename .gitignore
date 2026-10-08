@@ -29,7 +29,7 @@ plots/
 *.log
 
 # Bulk generated datasets (noncanonical). Human sessions and the legacy
-# runs.csv are tracked explicitly and are not affected by these patterns.
+# legacy/data/runs.csv are tracked explicitly and are not affected by these patterns.
 room_samples*.csv
 room_samples*.manifest.json
 eval_*.csv
@@ -40,3 +40,5 @@ eval_*.manifest.json
 # ...but project documentation must be tracked
 !README.md
 !**/README.md
+!docs/
+!docs/**/*.md
