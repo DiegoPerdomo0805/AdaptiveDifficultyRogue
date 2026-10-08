@@ -1,6 +1,6 @@
 {
-  "frozen_commit": "f742e4a9fdde166bd89ed12a67ab1f3ff417771d",
-  "recorded_at": "2026-10-08T01:01:59Z",
+  "frozen_commit": "22d398b142468949b0c8d0c032a09fd5f2d6686c",
+  "recorded_at": "2026-10-08T17:41:48Z",
   "contract_files": [
     "experiment_config.json",
     "dda_core.py",
@@ -12,10 +12,10 @@
     "node_map_gen.py",
     "loot_dataset.py"
   ],
-  "experiment_config_version": "exp_v3.1",
-  "experiment_config_status": "FROZEN: design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric, fixed_default, shared boss, collection mixtures, gates, split seeds, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). Do not modify after collection starts.",
-  "experiment_config_hash": "8f563054746351f3",
-  "bot_config_hash": "a633a143f59effdf",
+  "experiment_config_version": "exp_v3.2",
+  "experiment_config_status": "FROZEN: supersedes exp_v3.1 (kept in freeze_history/ and git). Design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric B_r, closed-loop checkpoint selection (mean(B_r) + 0.5*CVaR_0.90(B_r) on selection_validation rollouts; death <= 0.08, OOD excess <= 0.05, runtime guard <= 0.01, fallbacks <= 0.01), fixed_default, shared boss, collection mixtures, gates, split seeds, non-overlapping seed partitions, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). exp_v3.1 datasets are never reused. Do not modify after collection starts.",
+  "experiment_config_hash": "1a6a751469dcedd1",
+  "bot_config_hash": "cec025d6592e53a4",
   "schema_version": "room_samples_v4.0",
   "dda_version": "rule_based_dda_v1.2",
   "bot_policy_version": "dfs_backtrack_v4",
@@ -173,9 +173,62 @@
       1000000,
       4999999
     ],
-    "evaluation": [
+    "selection_validation": [
+      8000000,
+      8999999
+    ],
+    "used_in_pilot_smoke_evaluations": [
       9000000,
+      9099999
+    ],
+    "smoke_test": [
+      9100000,
+      9199999
+    ],
+    "final_test": [
+      9500000,
       9999999
-    ]
+    ],
+    "description": "Non-overlapping partitions. train_collection: data for Q/G/D and Q_loot. selection_validation: closed-loop checkpoint selection only. final_test: the final controller comparison only -- never used to train, tune, select epochs/checkpoints or change targets. smoke_test: pre-freeze smoke comparisons. used_in_pilot_smoke_evaluations: consumed by exp_v2/v3.1 smoke evaluations, never used again."
+  },
+  "cgan_selection": {
+    "closed_loop": {
+      "description": "Final checkpoint selection uses OBSERVED closed-loop bot rollouts, never Q predictions. Candidate filtering: every candidate_every_epochs epochs, an epoch that passes the room-level gates (validity, min_diversity, min_sensitivity, min_epoch) becomes a candidate; after training the top_k_candidates by room-level selection score are saved through the normal checkpoint path, reloaded through model_runtime (compatibility validation) and rolled out on the frozen validation seeds (first n_runs seeds of seed_blocks.selection_validation, enemy controller = the candidate, reward policy = reward_policy, shared boss). selection_score = mean(B_r) + cvar_coef * CVaR_alpha(B_r); lower is better. CVaR_alpha = mean of the worst ceil((1-alpha)*n) run-level B_r values. Eligible only if: room-level validity/diversity/sensitivity gates pass, every validation action is valid, observed ordinary-room death rate <= max_ordinary_death_rate, every fallback is recorded and is an OOD-guard fallback, the checkpoint reloads through model_runtime, ood_excess <= max_ood_excess, runtime_guard_rate <= max_runtime_guard_rate and fallback_rate <= max_fallback_rate. OOD decomposition (post hoc on the logged rows, never altering the rollout): for every ordinary-room state reached by the candidate, the support ratio (kNN distance / training threshold) of the candidate's generated action and of the heuristic (rule_based_dda) counterfactual action for exactly the same state; cgan_ood_rate and heuristic_same_state_ood_rate are the shares with ratio > 1, ood_excess = cgan_ood_rate - heuristic_same_state_ood_rate (not clipped), runtime_guard_rate = share of generated actions with ratio > enemy_action_support.runtime_ood_factor. The absolute cGAN OOD rate is a diagnostic, not a gate. If no candidate is eligible, selection fails and no checkpoint is produced.",
+      "validation_seed_block": "selection_validation",
+      "n_runs": 200,
+      "reward_policy": "heuristic",
+      "cvar_alpha": 0.9,
+      "cvar_coef": 0.5,
+      "max_ordinary_death_rate": 0.08,
+      "max_ood_excess": 0.05,
+      "max_runtime_guard_rate": 0.01,
+      "max_fallback_rate": 0.01,
+      "candidate_every_epochs": 5,
+      "top_k_candidates": 6
+    },
+    "min_epoch": 10,
+    "min_diversity": 0.01,
+    "min_sensitivity": 0.01,
+    "w_invalid": 10.0,
+    "w_diversity": 0.5,
+    "diversity_cap": 0.1,
+    "w_sensitivity": 0.5,
+    "sensitivity_cap": 0.1,
+    "w_jitter": 0.25,
+    "w_ood": 2.0,
+    "diversity_samples": 8
+  },
+  "cgan_training": {
+    "lambda_balance": 10.0,
+    "lambda_diversity": 1.0,
+    "description": "Defaults for train_cgan.py (CLI flags override and are recorded). lambda_balance=1 let the adversarial term pull G back toward the observed action distribution during the smoke pilot."
+  },
+  "balance_loss": {
+    "shape": "pseudo_huber_capped_scale",
+    "description": "term_i = w_i * 2*(sqrt(1+(d/s)^2)-1) with d the distance outside the interval and s the configured scale capped, per side, at the distance between that interval bound and the physical limit; L = sum(term_i)/sum(w_i). Chosen to remove asymmetric scale artefacts and unbounded quadratic dominance (pre-freeze audit), not to favour any controller."
+  },
+  "primary_metric": {
+    "name": "run_level_ordinary_balance",
+    "description": "Per run, over ordinary combat rooms only (no boss, no non-combat rooms): death rate = deaths / rooms; post_hp = mean post-room HP ratio (0 for a fatal room); damage_share = sum(taken) / (sum(taken) + sum(dealt)); combat_efficiency = sum(kills) / max(sum(hits), 1); duration_norm = mean per-room min(t/30 s, 1). B_r = balance loss of that vector. Controllers are ranked by mean B_r across runs (run = experimental unit), with bootstrap CIs and matched-seed paired differences. Runs without ordinary combat rooms are excluded and counted."
   }
 }
