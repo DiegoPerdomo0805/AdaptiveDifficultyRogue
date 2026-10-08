@@ -2,7 +2,8 @@
 # Stage B -- principal collection in isolated, validated seed blocks.
 #   scripts/02_collect.sh <exp_dir>
 # Env: RUNS (total, default 9000 ~ 30k combat rooms), BLOCK_RUNS (default 1500),
-#      MIX (default exploration=0.65,heuristic=0.20,fixed=0.15),
+#      MIX (enemy controllers, default exploration=0.65,heuristic=0.20,fixed=0.15),
+#      REWARD_MIX (reward policies, default exploration=0.60,heuristic=0.20,fixed_uniform=0.20),
 #      SEED (default: start of seed_blocks.train_collection), WORKERS (default 6),
 #      ALLOW_PILOT_CONFIG=1 to collect with a non-FROZEN experiment config (NOT for the thesis).
 source "$(dirname "$0")/common.sh"
@@ -17,6 +18,7 @@ fi
     || die "working tree has uncommitted changes; commit before the dataset freeze (ALLOW_DIRTY=1 overrides)."
 RUNS="${RUNS:-9000}"; BLOCK_RUNS="${BLOCK_RUNS:-1500}"; WORKERS="${WORKERS:-6}"
 MIX="${MIX:-exploration=0.65,heuristic=0.20,fixed=0.15}"
+REWARD_MIX="${REWARD_MIX:-exploration=0.60,heuristic=0.20,fixed_uniform=0.20}"
 SEED="${SEED:-$(json_get experiment_config.json 'd["seed_blocks"]["train_collection"][0]')}"
 MAXSEED="$(json_get experiment_config.json 'd["seed_blocks"]["train_collection"][1]')"
 [ $((SEED + RUNS - 1)) -le "$MAXSEED" ] || die "seed range exceeds seed_blocks.train_collection"
@@ -27,7 +29,8 @@ done_runs=0; b=0
 while [ "$done_runs" -lt "$RUNS" ]; do
     n=$(( RUNS - done_runs < BLOCK_RUNS ? RUNS - done_runs : BLOCK_RUNS ))
     out="$SDIR/blocks/block_$(printf %03d $b).csv"
-    "$PY" bot_runner.py --runs "$n" --seed $((SEED + done_runs)) --controller "$MIX" \
+    "$PY" bot_runner.py --runs "$n" --seed $((SEED + done_runs)) --enemy-controller "$MIX" \
+        --reward-policy "$REWARD_MIX" \
         --workers "$WORKERS" --out "$out" --validate
     "$PY" dataset_tools.py stats --csv "$out" --out "${out%.csv}.stats.json" \
         || die "stop condition raised for $out (see ${out%.csv}.stats.json)"
@@ -37,5 +40,7 @@ done
 "$PY" dataset_tools.py merge "${ARGS[@]}" --out "$SDIR/train_data.csv"
 "$PY" dataset_tools.py stats --csv "$SDIR/train_data.csv" --out "$SDIR/train_stats.json" \
     || die "stop condition raised for the merged dataset"
-"$PY" balance.py calibrate --csv "$SDIR/train_data.csv" --out "$SDIR/outcome_report.json"
+"$PY" loot_dataset.py --csv "$SDIR/train_data.csv" --out "$SDIR/train_loot.csv"
+"$PY" balance.py calibrate --csv "$SDIR/train_data.csv" --loot-csv "$SDIR/train_loot.csv" \
+    --out "$SDIR/outcome_report.json"
 stage_done

@@ -97,7 +97,8 @@
   "q_loot_gate": {
     "min_reward_gain_rel": 0.01,
     "require_beats_naive": true,
-    "description": "Learned loot is trained only if the best reward-aware Q_loot beats the state-only Q_loot(x) on held-out runs by min_reward_gain_rel in aggregate skill, and beats the naive predictor."
+    "split_seeds": [0, 1, 2],
+    "description": "Learned loot is trained only if a reward-aware Q_loot beats its information-matched state-only twin (x+c vs x, x+c+item+prior vs x+prior) on held-out runs by a MEAN aggregate-skill gain >= min_reward_gain_rel with a positive gain on EVERY grouped split in split_seeds, and beats the naive predictor on every split."
   },
 
   "cgan_training": {

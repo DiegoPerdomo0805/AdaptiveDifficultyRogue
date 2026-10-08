@@ -6,7 +6,11 @@ usage_exp "$@"
 require_done "$1" 05_evaluate
 stage_begin "$1" 06_analyze "$@"
 cd "$REPO"
-"$PY" analyze_results.py --eval-dir "$EXP/05_evaluate/eval" --out-dir "$SDIR/results" --plots --bootstrap 2000
+"$PY" analyze_results.py --eval-dir "$EXP/05_evaluate/eval_enemy" --out-dir "$SDIR/results/enemy" --plots --bootstrap 2000
+"$PY" analyze_results.py --eval-dir "$EXP/05_evaluate/eval_reward" --out-dir "$SDIR/results/reward" --plots --bootstrap 2000
+"$PY" analyze_loot.py --loot-csv "$EXP/02_collect/train_loot.csv" --q-loot-dir "$EXP/03_train_q/q_loot" \
+    --out-dir "$SDIR/results/loot_descriptive" --bootstrap 2000 > /dev/null
+cp "$EXP/03_train_q/q_loot/q_loot_report.json" "$SDIR/results/q_loot_report.json"
 cp "$EXP/03_train_q/q_selected/q_report.json" "$SDIR/results/q_report.json"
 cp "$EXP/04_train_cgan/selection.json" "$SDIR/results/cgan_selection.json"
 cp "$EXP/04_train_cgan/selected/cgan_report.json" "$SDIR/results/cgan_report.json"

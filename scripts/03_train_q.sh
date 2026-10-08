@@ -17,6 +17,18 @@ for s in ${Q_SEEDS:-0 1 2}; do
     [ $rc -eq 0 ] || { echo "Q seed $s FAILED its gate (rc=$rc)"; fail=1; }
 done
 [ $fail -eq 0 ] || die "Q gate failed for at least one seed: do not train the cGAN; improve action coverage."
+# Q_loot: a failed learned-loot gate is a RESULT, not a pipeline error -- the
+# descriptive loot analysis stays valid and learned_loot is simply not trained.
+set +e
+"$PY" train_q_loot.py --loot-csv "$EXP/02_collect/train_loot.csv" --out-dir "$SDIR/q_loot" \
+    --device "${DEVICE:-auto}"
+rc=$?
+set -e
+case $rc in
+    0) echo "learned-loot gate PASSED" ;;
+    2) echo "learned-loot gate FAILED: learned_loot will not be trained" ;;
+    *) die "train_q_loot.py crashed (rc=$rc)" ;;
+esac
 first=$(echo ${Q_SEEDS:-0 1 2} | awk '{print $1}')
 ln -s "q_seed$first" "$SDIR/q_selected"
 stage_done
