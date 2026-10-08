@@ -132,7 +132,8 @@ def analyze(paths: List[str], out_dir: str, b: int = 1000, seed: int = 0, q_loot
         sel = [r for r in observed if r["selected_category"] != "none"]
         preds = qp.predict_rows(sel) if sel else []
         cfg = balance.load_experiment_config()
-        pred = {r["loot_event_id"]: (balance.balance_distance(p, cfg, "loot"), p) for r, p in zip(sel, preds)}
+        pred = {r["loot_event_id"]: (balance.expected_balance_distance(p, cfg, "loot"), p)
+                for r, p in zip(sel, preds)}
         summary["q_loot_variant"] = qp.variant
 
     for cat in CATS:

@@ -182,6 +182,17 @@ def balance_distance(y: Sequence[float], cfg: Optional[dict] = None, family: str
     return sum(balance_terms(y, cfg, family)) / max(sum(weight), 1e-12)
 
 
+def expected_balance_distance(pred: Sequence[float], cfg: Optional[dict] = None, family: str = "enemy") -> float:
+    """Expected balance loss when the binary outcome (index 0) is Bernoulli
+    with the predicted probability: p * L(y|1) + (1 - p) * L(y|0). This is
+    the model's prediction of the OBSERVED per-event balance distance (which
+    sees a 0/1 outcome); plugging p itself into the loss is not, because the
+    loss is non-linear in that component."""
+    p = min(max(float(pred[0]), 0.0), 1.0)
+    one, zero = [1.0] + list(pred[1:]), [0.0] + list(pred[1:])
+    return p * balance_distance(one, cfg, family) + (1 - p) * balance_distance(zero, cfg, family)
+
+
 def in_target(y: Sequence[float], cfg: Optional[dict] = None, family: str = "enemy") -> List[bool]:
     low, high, _, _ = target_arrays(cfg, family)
     return [low[i] <= y[i] <= high[i] for i in range(len(low))]

@@ -57,6 +57,14 @@ def test_balance_loss_zero_inside_and_grows_outside():
     assert balance.balance_distance(y) > 0
 
 
+def test_expected_balance_distance_is_bernoulli_mixture():
+    y = [0.25, 0.6, 0.15, 0.3, 0.2]
+    e = balance.expected_balance_distance(y)
+    assert e == pytest.approx(0.25 * balance.balance_distance([1.0] + y[1:])
+                              + 0.75 * balance.balance_distance([0.0] + y[1:]))
+    assert e > balance.balance_distance(y)          # convex loss: E[L] >= L(E)
+
+
 def test_balance_loss_torch_matches_python():
     torch = pytest.importorskip("torch")
     ys = [[0.3, 0.9, 0.05, 0.6, 0.7], [0.0, 0.5, 0.2, 0.3, 0.3], [1.0, 0.0, 2.0, 0.0, 1.5]]

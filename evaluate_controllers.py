@@ -126,11 +126,15 @@ def enemy_predicted_vs_observed(q_source: str, per_condition_rows: dict) -> dict
             d["mean_" + col] = {"predicted": sum(p[j] for p in pred) / len(pred),
                                 "observed": sum(o[j] for o in obs) / len(obs)}
         d["mean_balance_distance"] = {
-            "predicted": sum(balance.balance_distance(p, cfg) for p in pred) / len(pred),
+            "predicted": sum(balance.expected_balance_distance(p, cfg) for p in pred) / len(pred),
             "observed": sum(balance.balance_distance(o, cfg) for o in obs) / len(obs)}
+        mp = [sum(p[j] for p in pred) / len(pred) for j in range(len(pred[0]))]
+        mo = [sum(o[j] for o in obs) / len(obs) for j in range(len(obs[0]))]
+        d["rate_level_balance_distance"] = {"predicted": balance.balance_distance(mp, cfg),
+                                            "observed": balance.balance_distance(mo, cfg)}
         out["by_condition"][cond] = d
-    out["note"] = ("predicted balance uses P(death); observed uses the 0/1 death outcome, so per-room "
-                   "balance distances are not identical quantities -- compare the per-outcome means first")
+    out["note"] = ("predicted balance distance = expected loss with death ~ Bernoulli(P(death)) "
+                   "(balance.expected_balance_distance), comparable to the observed mean over 0/1 deaths")
     return out
 
 
@@ -154,10 +158,15 @@ def loot_predicted_vs_observed(q_loot_dir: str, per_condition_rows: dict) -> dic
             d["mean_" + col] = {"predicted": sum(p[j] for p in pred) / len(pred),
                                 "observed": sum(o[j] for o in obs) / len(obs)}
         d["delayed_utility"] = {
-            "predicted": -sum(balance.balance_distance(p, cfg, "loot") for p in pred) / len(pred),
+            "predicted": -sum(balance.expected_balance_distance(p, cfg, "loot") for p in pred) / len(pred),
             "observed": -sum(balance.balance_distance(o, cfg, "loot") for o in obs) / len(obs)}
+        mp = [sum(p[j] for p in pred) / len(pred) for j in range(len(pred[0]))]
+        mo = [sum(o[j] for o in obs) / len(obs) for j in range(len(obs[0]))]
+        d["rate_level_utility"] = {"predicted": -balance.balance_distance(mp, cfg, "loot"),
+                                   "observed": -balance.balance_distance(mo, cfg, "loot")}
         out["by_condition"][cond] = d
-    out["note"] = "utility = -horizon balance distance; predicted uses P(death_within), observed the 0/1 outcome"
+    out["note"] = ("utility = -horizon balance distance; predicted = expected loss with death_within ~ "
+                   "Bernoulli(P), comparable to the observed mean over 0/1 outcomes")
     return out
 
 
