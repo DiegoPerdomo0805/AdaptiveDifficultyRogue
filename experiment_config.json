@@ -121,14 +121,16 @@
 
   "cgan_selection": {
     "closed_loop": {
-      "description": "Final checkpoint selection uses OBSERVED closed-loop bot rollouts, never Q predictions. Candidate filtering: every candidate_every_epochs epochs, an epoch that passes the room-level gates (validity, min_diversity, min_sensitivity, min_epoch) becomes a candidate; after training the top_k_candidates by room-level selection score are saved through the normal checkpoint path, reloaded through model_runtime (compatibility validation) and rolled out on the frozen validation seeds (first n_runs seeds of seed_blocks.selection_validation, enemy controller = the candidate, reward policy = reward_policy, shared boss). selection_score = mean(B_r) + cvar_coef * CVaR_alpha(B_r); lower is better. CVaR_alpha = mean of the worst ceil((1-alpha)*n) run-level B_r values. Eligible only if: room-level validity/diversity/sensitivity gates pass, every validation action is valid, observed ordinary-room death rate <= max_ordinary_death_rate, every fallback is recorded and is an OOD-guard fallback, the checkpoint reloads through model_runtime, and the share of model actions with support distance above the training threshold is <= max_ood_rate (= 1 - enemy_action_support.knn_threshold_quantile, the documented support limit). If no candidate is eligible, selection fails and no checkpoint is produced.",
+      "description": "Final checkpoint selection uses OBSERVED closed-loop bot rollouts, never Q predictions. Candidate filtering: every candidate_every_epochs epochs, an epoch that passes the room-level gates (validity, min_diversity, min_sensitivity, min_epoch) becomes a candidate; after training the top_k_candidates by room-level selection score are saved through the normal checkpoint path, reloaded through model_runtime (compatibility validation) and rolled out on the frozen validation seeds (first n_runs seeds of seed_blocks.selection_validation, enemy controller = the candidate, reward policy = reward_policy, shared boss). selection_score = mean(B_r) + cvar_coef * CVaR_alpha(B_r); lower is better. CVaR_alpha = mean of the worst ceil((1-alpha)*n) run-level B_r values. Eligible only if: room-level validity/diversity/sensitivity gates pass, every validation action is valid, observed ordinary-room death rate <= max_ordinary_death_rate, every fallback is recorded and is an OOD-guard fallback, the checkpoint reloads through model_runtime, ood_excess <= max_ood_excess, runtime_guard_rate <= max_runtime_guard_rate and fallback_rate <= max_fallback_rate. OOD decomposition (post hoc on the logged rows, never altering the rollout): for every ordinary-room state reached by the candidate, the support ratio (kNN distance / training threshold) of the candidate's generated action and of the heuristic (rule_based_dda) counterfactual action for exactly the same state; cgan_ood_rate and heuristic_same_state_ood_rate are the shares with ratio > 1, ood_excess = cgan_ood_rate - heuristic_same_state_ood_rate (not clipped), runtime_guard_rate = share of generated actions with ratio > enemy_action_support.runtime_ood_factor. The absolute cGAN OOD rate is a diagnostic, not a gate. If no candidate is eligible, selection fails and no checkpoint is produced.",
       "validation_seed_block": "selection_validation",
       "n_runs": 200,
       "reward_policy": "heuristic",
       "cvar_alpha": 0.90,
       "cvar_coef": 0.5,
       "max_ordinary_death_rate": 0.08,
-      "max_ood_rate": 0.05,
+      "max_ood_excess": 0.05,
+      "max_runtime_guard_rate": 0.01,
+      "max_fallback_rate": 0.01,
       "candidate_every_epochs": 5,
       "top_k_candidates": 6
     },

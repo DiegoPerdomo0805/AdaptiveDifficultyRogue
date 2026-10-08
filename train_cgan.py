@@ -325,7 +325,8 @@ def main(argv=None):
         else:
             print(f"candidate epoch {c['epoch']:4d}: score {m['selection_score']:.4f} mean {m['mean_B_r']:.4f} "
                   f"median {m['median_B_r']:.4f} CVaR {m['cvar_B_r']:.4f} death {m['ordinary_room_death_rate']:.4f} "
-                  f"d1 {m['depth1_death_rate']:.4f} ood {m['ood_action_rate']:.4f} -> "
+                  f"d1 {m['depth1_death_rate']:.4f} ood {m['cgan_ood_rate']:.4f}/heur {m['heuristic_same_state_ood_rate']:.4f} "
+                  f"excess {m['ood_excess']:+.4f} guard {m['runtime_guard_rate']:.4f} fb {m['fallback_rate']:.4f} -> "
                   + ("ELIGIBLE" if not reasons else "ineligible: " + "; ".join(reasons)))
 
     report = {"q_gate": gate, "hparams": vars(args), "n_train_rows": len(tr_rows), "n_val_rows": len(va_rows),

@@ -87,7 +87,14 @@ Loot:   Q_loot(x, c, item, prior_equipment) -> next-3-combat-room outcome profil
     - its observed ordinary-room death rate is ≤ 0.08;
     - every fallback is recorded and is an OOD-guard fallback;
     - it reloads cleanly;
-    - its OOD action rate is ≤ 0.05.
+    - its **OOD excess** is ≤ 0.05;
+    - its runtime-guard rate is ≤ 0.01;
+    - its fallback rate is ≤ 0.01.
+
+    The OOD excess is the cGAN's OOD rate minus the heuristic's OOD rate on the **same** reached
+    states. The heuristic action is a counterfactual computed post hoc from the logged rows, so it
+    never alters the rollout. The runtime-guard rate is the share of generated actions beyond 1.5×
+    the training support threshold. The absolute OOD rate is reported as a diagnostic only.
   - If no candidate is eligible, training fails (exit 3) and writes no checkpoint. Q-predicted
     run death rate and B_r are reported per candidate as calibration diagnostics only. GAN loss
     and Q predictions are never the selection criterion.

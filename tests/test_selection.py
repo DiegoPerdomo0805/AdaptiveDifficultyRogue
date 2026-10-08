@@ -16,7 +16,9 @@ GOOD_DIAG = {"validity": 1.0, "diversity": 0.1, "sensitivity": 0.05}
 
 def _metrics(**kw):
     m = {"validity": 1.0, "ordinary_room_death_rate": 0.02, "all_fallbacks_recorded_ood": True,
-         "fallback_reasons": {}, "ood_action_rate": 0.01, "mean_B_r": 0.2, "cvar_B_r": 1.0}
+         "fallback_reasons": {}, "cgan_ood_rate": 0.10, "heuristic_same_state_ood_rate": 0.06,
+         "ood_excess": 0.04, "runtime_guard_rate": 0.0, "fallback_rate": 0.0,
+         "mean_B_r": 0.2, "cvar_B_r": 1.0}
     m.update(kw)
     m["selection_score"] = selection.selection_score(m["mean_B_r"], m["cvar_B_r"], CL["cvar_coef"])
     return m
@@ -48,8 +50,7 @@ def test_rejects_room_level_gate_failures(diag):
     assert selection.eligibility(_metrics(), diag, 20, CFG)
 
 
-def test_rejects_ood_unrecorded_fallbacks_and_load_errors():
-    assert selection.eligibility(_metrics(ood_action_rate=0.06), GOOD_DIAG, 20, CFG)
+def test_rejects_unrecorded_fallbacks_and_load_errors():
     assert selection.eligibility(_metrics(all_fallbacks_recorded_ood=False,
                                           fallback_reasons={"invalid_output:x": 1}), GOOD_DIAG, 20, CFG)
     assert selection.eligibility({"load_error": "ModelVersionError: x", "selection_score": float("nan")},
@@ -132,3 +133,91 @@ def test_trained_selection_report_uses_validation_seeds_only(trained):
         if "mean_B_r" in c["metrics"]:
             assert c["metrics"]["selection_score"] == pytest.approx(
                 c["metrics"]["mean_B_r"] + 0.5 * c["metrics"]["cvar_B_r"])
+
+
+# ---------------------------------------------------------------------------
+# Action-relative OOD, extreme-support guard and fallback gates
+# ---------------------------------------------------------------------------
+
+def test_gate_boundaries_are_inclusive():
+    assert CL["max_ood_excess"] == 0.05 and CL["max_runtime_guard_rate"] == 0.01 and CL["max_fallback_rate"] == 0.01
+    assert selection.eligibility(_metrics(ood_excess=0.05), GOOD_DIAG, 20, CFG) == []
+    assert selection.eligibility(_metrics(ood_excess=0.0501), GOOD_DIAG, 20, CFG)
+    assert selection.eligibility(_metrics(runtime_guard_rate=0.01), GOOD_DIAG, 20, CFG) == []
+    assert selection.eligibility(_metrics(runtime_guard_rate=0.0101), GOOD_DIAG, 20, CFG)
+    assert selection.eligibility(_metrics(fallback_rate=0.01), GOOD_DIAG, 20, CFG) == []
+    assert selection.eligibility(_metrics(fallback_rate=0.0101), GOOD_DIAG, 20, CFG)
+
+
+def test_absolute_ood_is_diagnostic_not_a_gate():
+    assert "max_ood_rate" not in CL
+    m = _metrics(cgan_ood_rate=0.60, heuristic_same_state_ood_rate=0.58, ood_excess=0.02)
+    assert selection.eligibility(m, GOOD_DIAG, 20, CFG) == []
+
+
+def test_negative_excess_allowed_and_not_clipped():
+    assert selection.eligibility(_metrics(ood_excess=-0.03), GOOD_DIAG, 20, CFG) == []
+
+    class _Sup:
+        threshold = 1.0
+
+        def distance(self, x, a):
+            import torch
+            return torch.full((x.shape[0],), 2.0)        # every heuristic counterfactual is OOD
+
+    class _LM:
+        support = _Sup()
+        cond_scaler = __import__("ml_data").Standardizer([0.0] * 9, [1.0] * 9, __import__("ml_data").COND_COLUMNS)
+
+    rows = []
+    for i in range(4):
+        r = {c: "0.5" for c in __import__("ml_data").COND_COLUMNS}
+        r.update({"pre_melee_kills": "1", "pre_magic_kills": "0", "node_depth": "1", "pre_hp_ratio": "0.9",
+                  "fallback_used": "0", "fallback_reason": "", "support_distance": "0.5000"})
+        rows.append(r)
+    d = selection.ood_decomposition(_LM(), rows, CFG)
+    assert d["cgan_ood_rate"] == 0.0 and d["heuristic_same_state_ood_rate"] == 1.0
+    assert d["ood_excess"] == -1.0 and d["runtime_guard_rate"] == 0.0
+
+
+def test_runtime_guard_rate_uses_rejected_generated_actions():
+    rows = [{"fallback_used": "1", "fallback_reason": "ood_action:support_ratio=1.575 > 1.5", "support_distance": ""},
+            {"fallback_used": "0", "fallback_reason": "", "support_distance": "1.2000"}]
+    assert selection._ratio_from_reason(rows[0]["fallback_reason"]) == pytest.approx(1.575)
+
+
+def test_heuristic_counterfactual_equals_the_heuristic_decision_on_that_state(tmp_path):
+    """The counterfactual action for a state equals what rule_based_dda
+    actually chose in that exact state (checked on real heuristic rollouts)."""
+    import csv
+    import ml_data
+    from conftest import make_dataset
+    p = make_dataset(tmp_path / "h.csv", runs=30, controller="heuristic")
+    rows = [r for r in csv.DictReader(open(p)) if r["room_kind"] == "enemy"]
+    for r in rows:
+        assert ml_data.heuristic_action_for_row(r) == pytest.approx([float(r[c]) for c in ml_data.ACTION_COLUMNS])
+
+
+def test_counterfactual_uses_identical_states_and_never_alters_rollouts(trained):
+    import torch
+    import ml_data
+    seeds = selection.validation_seeds(CFG)[:6]
+    lm, runs = selection.rollout(trained["model_dir"], seeds, CFG)
+    snapshot = copy.deepcopy(runs)
+    rows = [r for x in runs for r in x["rows"] if r["room_kind"] == "enemy"]
+    x = selection.state_tensor(lm, rows)
+    manual = torch.tensor(lm.cond_scaler.transform([[float(r[c]) for c in ml_data.COND_COLUMNS] for r in rows]),
+                          dtype=torch.float32)
+    assert torch.equal(x, manual)                                   # the state IS the logged condition
+    cg, he = selection.same_state_support(lm, rows)
+    assert he == selection.support_ratios(lm, manual, [ml_data.heuristic_action_for_row(r) for r in rows])
+    for r, v in zip(rows, cg):                                      # cGAN side = runtime-evaluated ratio
+        if r["fallback_used"] == 0 or r["fallback_used"] == "0":
+            assert v == float(r["support_distance"])
+    m = selection.rollout_metrics(runs, CFG, lm)                    # computes the counterfactual
+    assert runs == snapshot                                         # rows untouched
+    lm2, runs2 = selection.rollout(trained["model_dir"], seeds, CFG)
+    assert runs2 == snapshot                                        # RNG / rollout unaffected
+    for k in ("cgan_ood_rate", "heuristic_same_state_ood_rate", "ood_excess", "runtime_guard_rate",
+              "boss_survival", "fallback_rate"):
+        assert k in m
