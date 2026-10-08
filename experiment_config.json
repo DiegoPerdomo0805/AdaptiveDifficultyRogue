@@ -1,6 +1,6 @@
 {
-  "experiment_config_version": "exp_v3.1",
-  "status": "FROZEN: design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric, fixed_default, shared boss, collection mixtures, gates, split seeds, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). Do not modify after collection starts.",
+  "experiment_config_version": "exp_v3.2-pilot",
+  "status": "PILOT: supersedes the exp_v3.1 freeze (kept as history) because cGAN checkpoint selection was misaligned with the run-level primary metric. Adds closed-loop validation-rollout selection and explicit train/validation/test seed partitions. Targets, weights and loss shape are unchanged. Freeze as exp_v3.2 after all checks pass; exp_v3.1 datasets are never reused.",
 
   "enemy_controller": {
     "fixed": {
@@ -120,6 +120,18 @@
   },
 
   "cgan_selection": {
+    "closed_loop": {
+      "description": "Final checkpoint selection uses OBSERVED closed-loop bot rollouts, never Q predictions. Candidate filtering: every candidate_every_epochs epochs, an epoch that passes the room-level gates (validity, min_diversity, min_sensitivity, min_epoch) becomes a candidate; after training the top_k_candidates by room-level selection score are saved through the normal checkpoint path, reloaded through model_runtime (compatibility validation) and rolled out on the frozen validation seeds (first n_runs seeds of seed_blocks.selection_validation, enemy controller = the candidate, reward policy = reward_policy, shared boss). selection_score = mean(B_r) + cvar_coef * CVaR_alpha(B_r); lower is better. CVaR_alpha = mean of the worst ceil((1-alpha)*n) run-level B_r values. Eligible only if: room-level validity/diversity/sensitivity gates pass, every validation action is valid, observed ordinary-room death rate <= max_ordinary_death_rate, every fallback is recorded and is an OOD-guard fallback, the checkpoint reloads through model_runtime, and the share of model actions with support distance above the training threshold is <= max_ood_rate (= 1 - enemy_action_support.knn_threshold_quantile, the documented support limit). If no candidate is eligible, selection fails and no checkpoint is produced.",
+      "validation_seed_block": "selection_validation",
+      "n_runs": 200,
+      "reward_policy": "heuristic",
+      "cvar_alpha": 0.90,
+      "cvar_coef": 0.5,
+      "max_ordinary_death_rate": 0.08,
+      "max_ood_rate": 0.05,
+      "candidate_every_epochs": 5,
+      "top_k_candidates": 6
+    },
     "min_epoch": 10,
     "min_diversity": 0.01,
     "min_sensitivity": 0.01,
@@ -149,6 +161,10 @@
   "seed_blocks": {
     "pilot": [100000, 199999],
     "train_collection": [1000000, 4999999],
-    "evaluation": [9000000, 9999999]
+    "selection_validation": [8000000, 8999999],
+    "used_in_pilot_smoke_evaluations": [9000000, 9099999],
+    "smoke_test": [9100000, 9199999],
+    "final_test": [9500000, 9999999],
+    "description": "Non-overlapping partitions. train_collection: data for Q/G/D and Q_loot. selection_validation: closed-loop checkpoint selection only. final_test: the final controller comparison only -- never used to train, tune, select epochs/checkpoints or change targets. smoke_test: pre-freeze smoke comparisons. used_in_pilot_smoke_evaluations: consumed by exp_v2/v3.1 smoke evaluations, never used again."
   }
 }

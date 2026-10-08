@@ -24,8 +24,9 @@ eval_meta.json (git commit, command, checkpoints, hashes, predicted-vs-observed)
 and the analyze_results outputs.
 
 Safety: refuses an existing non-empty --out-dir; refuses evaluation seeds
-outside experiment_config seed_blocks.evaluation (unless
---allow-seeds-outside-eval-block) or overlapping any --train-csv manifest;
+outside the chosen test block (--seed-block final_test | smoke_test; the
+blocks never overlap training or checkpoint-selection seeds) or overlapping
+any --train-csv manifest;
 learned_loot is only evaluated with a loadable checkpoint produced under a
 passed Q_loot gate.
 """
@@ -53,11 +54,20 @@ def _ranges(seed_range):
     return [(int(seed_range[0]), int(seed_range[1]))]
 
 
-def check_seeds(seed: int, runs: int, train_csvs, cfg, allow_outside: bool):
+TEST_BLOCKS = ("final_test", "smoke_test")
+
+
+def check_seeds(seed: int, runs: int, train_csvs, cfg, allow_outside: bool, block: str = "final_test"):
     lo, hi = seed, seed + runs - 1
-    eb = cfg.get("seed_blocks", {}).get("evaluation")
-    if eb and not allow_outside and not (eb[0] <= lo and hi <= eb[1]):
-        raise SystemExit(f"evaluation seeds [{lo}, {hi}] are outside seed_blocks.evaluation {eb}")
+    if block not in TEST_BLOCKS:
+        raise SystemExit(f"evaluation must use a test seed block {TEST_BLOCKS}, not {block!r}")
+    eb = cfg["seed_blocks"][block]
+    if not allow_outside and not (eb[0] <= lo and hi <= eb[1]):
+        raise SystemExit(f"evaluation seeds [{lo}, {hi}] are outside seed_blocks.{block} {eb}")
+    for name in ("train_collection", "selection_validation", "pilot"):
+        a, b = cfg["seed_blocks"][name]
+        if not (hi < a or b < lo):
+            raise SystemExit(f"evaluation seeds [{lo}, {hi}] overlap seed_blocks.{name}")
     for p in train_csvs or []:
         man = telemetry.load_manifest(ml_data.manifest_path_for(p))
         for a, b in _ranges(man.get("seed_range")):
@@ -230,7 +240,8 @@ def main(argv=None):
     ap.add_argument("--loot-model-dir", default=None, help="learned-loot directory (gate-passed only)")
     ap.add_argument("--q-loot-dir", default=None, help="Q_loot directory for predicted-vs-observed utility")
     ap.add_argument("--runs", type=int, default=300)
-    ap.add_argument("--seed", type=int, default=9000000)
+    ap.add_argument("--seed-block", choices=list(TEST_BLOCKS), default="final_test")
+    ap.add_argument("--seed", type=int, default=None, help="default: start of --seed-block")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--train-csv", action="append", default=[],
@@ -269,7 +280,9 @@ def main(argv=None):
     if os.path.isdir(args.out_dir) and os.listdir(args.out_dir):
         ap.error(f"{args.out_dir} exists and is not empty; refusing to overwrite an experiment")
     cfg = balance.load_experiment_config()
-    check_seeds(args.seed, args.runs, args.train_csv, cfg, args.allow_seeds_outside_eval_block)
+    if args.seed is None:
+        args.seed = cfg["seed_blocks"][args.seed_block][0]
+    check_seeds(args.seed, args.runs, args.train_csv, cfg, args.allow_seeds_outside_eval_block, args.seed_block)
     os.makedirs(args.out_dir, exist_ok=True)
     t0 = time.time()
 
@@ -277,6 +290,7 @@ def main(argv=None):
             "axis": args.axis, "group_by": group_by, "conditions": conds,
             "held_fixed": ({"reward_policy": args.reward_policy} if args.axis == "enemy"
                            else {"enemy_controller": args.enemy_controller}),
+            "seed_block": args.seed_block,
             "seed_range": [args.seed, args.seed + args.runs - 1], "runs_per_condition": args.runs,
             "model_dir": args.model_dir, "loot_model_dir": args.loot_model_dir,
             "experiment_config_version": cfg["experiment_config_version"],

@@ -75,8 +75,33 @@ Loot:   Q_loot(x, c, item, prior_equipment) -> next-3-combat-room outcome profil
     (`x+c` vs `x`, `x+c+item+prior` vs `x+prior`). That means a mean gain ≥ `min_reward_gain_rel`
     with a positive gain on **every** grouped split. If the loot gate fails, `learned_loot` is not
     trained, and only the descriptive loot analysis is reported.
-* Model selection uses validation diagnostics: validity, Q-predicted balance, OOD rate, diversity,
-  sensitivity and jitter, with eligibility rules. It never uses GAN loss.
+* **Checkpoint selection is closed-loop** (`selection.py`). Room-level diagnostics only *filter*
+  candidates: every 5 epochs, an epoch that passes validity, diversity, sensitivity and `min_epoch`
+  becomes a candidate, and the top 6 by room-level score go forward.
+  - Each candidate is saved, reloaded through `model_runtime`, and **played by the bot** on the
+    frozen validation seeds (`seed_blocks.selection_validation`, 200 runs; reward policy heuristic).
+  - It is scored on **observed** outcomes: `selection_score = mean(B_r) + 0.5·CVaR_0.90(B_r)`
+    (lower is better; CVaR = mean of the worst ⌈0.1·n⌉ B_r).
+  - A candidate is eligible only if all of these hold:
+    - its validation actions are valid;
+    - its observed ordinary-room death rate is ≤ 0.08;
+    - every fallback is recorded and is an OOD-guard fallback;
+    - it reloads cleanly;
+    - its OOD action rate is ≤ 0.05.
+  - If no candidate is eligible, training fails (exit 3) and writes no checkpoint. Q-predicted
+    run death rate and B_r are reported per candidate as calibration diagnostics only. GAN loss
+    and Q predictions are never the selection criterion.
+* **Seed partitions** (`experiment_config.seed_blocks`, non-overlapping and validated):
+
+  | block | seeds | use |
+  |---|---|---|
+  | train_collection | 1,000,000–4,999,999 | training data |
+  | selection_validation | 8,000,000–8,999,999 | checkpoint selection |
+  | smoke_test | 9,100,000–9,199,999 | pre-freeze smoke comparisons |
+  | final_test | 9,500,000–9,999,999 | the final comparison only |
+  | used_in_pilot_smoke_evaluations | 9,000,000–9,099,999 | consumed earlier; retired |
+
+  Final-test seeds are never used to train, tune, select epochs or checkpoints, or change targets.
 * Archetype names (`player_profile`) are stratification metadata only. They are never a model input.
 
 ### Outcomes (`balance.py`)
@@ -230,9 +255,9 @@ python train_q_loot.py --loot-csv train_loot.csv --out-dir q_loot_out
 python train_loot_policy.py --loot-csv train_loot.csv --q-loot-dir q_loot_out --out-dir loot_model_out   # refuses unless gate passed
 python analyze_loot.py --loot-csv train_loot.csv --q-loot-dir q_loot_out --out-dir loot_results
 python evaluate_controllers.py --axis enemy --controllers fixed,heuristic,cgan --model-dir model_out \
-    --runs 300 --seed 9000000 --out-dir experiments/eval_enemy --train-csv train.csv --plots
+    --runs 300 --seed-block final_test --out-dir experiments/eval_enemy --train-csv train.csv --plots
 python evaluate_controllers.py --axis reward --reward-policies fixed_uniform,heuristic --q-loot-dir q_loot_out \
-    --runs 300 --seed 9000000 --out-dir experiments/eval_reward --train-csv train.csv --plots
+    --runs 300 --seed-block final_test --out-dir experiments/eval_reward --train-csv train.csv --plots
 
 ROGUE_CONTROLLER=cgan ROGUE_MODEL_DIR=model_out ROGUE_REWARD_POLICY=heuristic python rogue.py
 ```

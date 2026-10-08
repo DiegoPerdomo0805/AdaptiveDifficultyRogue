@@ -38,13 +38,16 @@ def test_eval_seed_guards(pilot_csv):
         evaluate_controllers.check_seeds(100000, 10, [], cfg, False)
     with pytest.raises(SystemExit):     # overlaps training seeds
         evaluate_controllers.check_seeds(100050, 10, [pilot_csv], cfg, True)
-    evaluate_controllers.check_seeds(9000000, 10, [pilot_csv], cfg, False)
+    with pytest.raises(SystemExit):     # retired pilot-smoke seeds are not a test block
+        evaluate_controllers.check_seeds(9000000, 10, [pilot_csv], cfg, False, "final_test")
+    evaluate_controllers.check_seeds(cfg["seed_blocks"]["final_test"][0], 10, [pilot_csv], cfg, False, "final_test")
+    evaluate_controllers.check_seeds(cfg["seed_blocks"]["smoke_test"][0], 10, [pilot_csv], cfg, False, "smoke_test")
 
 
 def test_equivalent_seed_evaluation_end_to_end(trained, tmp_path):
     out = tmp_path / "eval"
     rc = evaluate_controllers.main(["--axis", "enemy", "--controllers", "fixed,heuristic,cgan", "--model-dir",
-                                    trained["model_dir"], "--runs", "20", "--seed", "9000000",
+                                    trained["model_dir"], "--runs", "20", "--seed-block", "smoke_test",
                                     "--out-dir", str(out), "--train-csv", trained["csv"],
                                     "--bootstrap", "50"])
     assert rc == 0
@@ -75,5 +78,5 @@ def test_equivalent_seed_evaluation_end_to_end(trained, tmp_path):
              for c in ("fixed", "heuristic", "cgan")}
     assert seeds["fixed"] == seeds["heuristic"] == seeds["cgan"]
     with pytest.raises(SystemExit):     # refuses to overwrite an experiment
-        evaluate_controllers.main(["--axis", "enemy", "--controllers", "fixed", "--runs", "2", "--seed", "9000000",
+        evaluate_controllers.main(["--axis", "enemy", "--controllers", "fixed", "--runs", "2", "--seed-block", "smoke_test",
                                    "--out-dir", str(out)])

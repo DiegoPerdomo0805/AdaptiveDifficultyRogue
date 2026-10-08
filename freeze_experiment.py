@@ -59,6 +59,10 @@ def current_contract() -> dict:
         "loot_action_support": cfg["loot_action_support"],
         "loot_horizon": cfg["loot_horizon"],
         "seed_blocks": cfg["seed_blocks"],
+        "cgan_selection": cfg["cgan_selection"],
+        "cgan_training": cfg["cgan_training"],
+        "balance_loss": cfg["balance_loss"],
+        "primary_metric": cfg["primary_metric"],
     }
 
 

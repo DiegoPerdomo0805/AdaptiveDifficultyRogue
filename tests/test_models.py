@@ -80,7 +80,8 @@ def test_trained_q_report_and_generator_diagnostics(trained):
 def test_checkpoint_contents(trained):
     ck = torch.load(os.path.join(trained["model_dir"], "cgan_checkpoint.pt"), weights_only=True)
     for key in ("generator_state_dict", "discriminator_state_dict", "q_state_dict", "optimizer_g_state",
-                "optimizer_d_state", "epoch", "best_score", "seed", "hparams", "cond_columns",
+                "optimizer_d_state", "epoch", "room_level_score", "closed_loop_selection", "seed", "hparams",
+                "cond_columns",
                 "action_columns", "outcome_columns", "cond_scaler", "outcome_scaler", "history",
                 "config_hash", "experiment_config_hash", "dda_version", "dataset_schema_version",
                 "support_state", "action_support_box"):

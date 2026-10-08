@@ -106,6 +106,21 @@ def _validate_config(cfg: dict):
         raise ExperimentConfigError(f"outcomes.columns must be {OUTCOME_COLUMNS}")
     if cfg["loot_horizon"].get("columns") != LOOT_OUTCOME_COLUMNS:
         raise ExperimentConfigError(f"loot_horizon.columns must be {LOOT_OUTCOME_COLUMNS}")
+    blocks = {k: v for k, v in cfg.get("seed_blocks", {}).items() if isinstance(v, list)}
+    names = sorted(blocks)
+    for i, a_ in enumerate(names):
+        lo, hi = blocks[a_]
+        if lo > hi:
+            raise ExperimentConfigError(f"seed block {a_} is empty")
+        for b_ in names[i + 1:]:
+            if not (hi < blocks[b_][0] or blocks[b_][1] < lo):
+                raise ExperimentConfigError(f"seed blocks {a_} and {b_} overlap")
+    for req in ("train_collection", "selection_validation", "final_test"):
+        if req not in blocks:
+            raise ExperimentConfigError(f"seed_blocks.{req} is required")
+    cl = cfg.get("cgan_selection", {}).get("closed_loop")
+    if not cl or cl.get("validation_seed_block") != "selection_validation":
+        raise ExperimentConfigError("cgan_selection.closed_loop must validate on seed_blocks.selection_validation")
     if cfg.get("balance_loss", {}).get("shape") != "pseudo_huber_capped_scale":
         raise ExperimentConfigError("balance_loss.shape must be 'pseudo_huber_capped_scale'")
     if float(cfg["outcomes"].get("duration_norm_cap", 0)) != 1.0:

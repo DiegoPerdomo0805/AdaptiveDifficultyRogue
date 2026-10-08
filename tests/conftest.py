@@ -35,6 +35,6 @@ def trained(tmp_path_factory, pilot_csv):
     d = tmp_path_factory.mktemp("models")
     q_dir, m_dir = str(d / "q"), str(d / "m")
     train_q.main(["--csv", pilot_csv, "--out-dir", q_dir, "--epochs", "40", "--patience", "10"])
-    train_cgan.main(["--csv", pilot_csv, "--q-dir", q_dir, "--out-dir", m_dir, "--epochs", "15",
-                     "--allow-failed-q-gate"])
+    train_cgan.main(["--csv", pilot_csv, "--q-dir", q_dir, "--out-dir", m_dir, "--epochs", "25",
+                     "--validation-runs", "20", "--allow-failed-q-gate"])
     return {"csv": pilot_csv, "q_dir": q_dir, "model_dir": m_dir}
