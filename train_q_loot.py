@@ -108,6 +108,28 @@ def fit(net, tr, va, cont_var, args, torch, models):
     return {"best_val_loss": best[0], "best_epoch": best[2], "history": hist}
 
 
+def prediction_ranges(net, variant, rows, cond_scaler, torch, models, n_states=60, n_loadouts=16) -> dict:
+    """Min/max of every output over held-out states x every (category, item)
+    choice x random prior loadouts; must lie inside the physical ranges."""
+    import random as _r
+    rng = _r.Random(0)
+    cond = cond_scaler.transform([[float(r[c]) for c in ml_data.COND_COLUMNS] for r in rows[:n_states]])
+    feats = []
+    for cs in cond:
+        for _ in range(n_loadouts):
+            eq = {s: rng.choice(core.ITEMS_BY_SLOT[s]).item_id for s in core.SLOTS}
+            for cat in core.SLOTS:
+                for it in core.ITEMS_BY_SLOT[cat]:
+                    feats.append(ml_data.loot_features(cs, eq, cat, it.item_id, variant))
+    net.eval()
+    with torch.no_grad():
+        y = models.outcomes_physical(net(torch.tensor(feats, dtype=torch.float32)))
+    rngs = balance.output_ranges("loot")
+    return {c: {"min": float(y[:, j].min()), "max": float(y[:, j].max()), "physical_range": list(rngs[j]),
+                "inside_physical_range": bool(y[:, j].min() >= rngs[j][0] - 1e-6 and y[:, j].max() <= rngs[j][1] + 1e-6)}
+            for j, c in enumerate(COLS)}
+
+
 def fit_split(rows, split_seed, args, cfg, torch, models, device) -> dict:
     """Fit every variant on one grouped split; return metrics + states."""
     split = ml_data.grouped_split(rows, tuple(float(v) for v in args.split.split(",")), seed=split_seed)
@@ -149,6 +171,7 @@ def fit_split(rows, split_seed, args, cfg, torch, models, device) -> dict:
                 pred = models.outcomes_physical(net(part[0])).cpu().tolist()
             m = evaluate_predictions(pred, part[3], prev, mean, COLS)
             entry[name] = {"metrics": m, "skill": aggregate_skill(m, COLS)}
+        entry["prediction_ranges"] = prediction_ranges(net, variant, te_rows, cond_scaler, torch, models)
         out["variants"][variant] = entry
         out["states"][variant] = net.state_dict()
         out["hparams"][variant] = net.hparams
@@ -269,6 +292,10 @@ def main(argv=None):
                   + ("PASS" if c["passes"] else "fail"))
         else:
             print(f"   gate {k} vs {c['twin']}: {c['reason']}")
+    for v in ml_data.LOOT_VARIANTS:
+        r = primary["variants"][v]["prediction_ranges"]
+        print(f"   ranges {v:4s} " + "  ".join(f"{c}:[{x['min']:.3f},{x['max']:.3f}]" for c, x in r.items())
+              + ("" if all(x["inside_physical_range"] for x in r.values()) else "  OUT OF RANGE"))
     print(f"LEARNED-LOOT GATE: {'PASSED (' + gate['chosen_variant'] + ')' if gate['passed'] else 'FAILED'}")
     return 0 if gate["passed"] else 2
 

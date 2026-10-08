@@ -7,7 +7,8 @@ A pygame top-down roguelike used as a testbed for **dynamic difficulty adjustmen
 **Included**
 - Outcome-guided adaptation of enemy HP, damage, speed and spawn count.
 - Outcome-guided adaptation of the **loot category** (weapon, spell, armor, boots).
-- Fixed item definitions and fixed item statistics.
+- Fixed item definitions and fixed item statistics (already-declared item effects made functional,
+  e.g. boots' dash distance).
 - Evaluating a selected reward over the **next three combat rooms** (or until the run ends).
 - A **shared deterministic boss policy** used by every experimental controller.
 
@@ -38,7 +39,7 @@ Enemy-free rooms log a placeholder action. No enemy model is called in boss room
 
 | controller (`--enemy-controller`) | role |
 |---|---|
-| `fixed` | constant reference action, no adaptation (baseline) |
+| `fixed` | **fixed_default**: hp/dmg/speed multipliers 1.0, spawn_count 2 (`DDA_SPAWN_BASE`); no adaptation |
 | `heuristic` | `rule_based_dda` (baseline, exploration anchor, runtime fallback; **never a label**) |
 | `exploration` | seeded bounded variation for data collection: perturb / uniform / reference |
 | `cgan` | outcome-guided generator with a logged heuristic fallback |
@@ -88,7 +89,7 @@ Enemy outcomes, per ordinary combat room:
 | `post_hp_ratio` | HP after the room (0 on death) |
 | `damage_share` | taken / (taken + dealt) |
 | `combat_efficiency` | kills / max(hits, 1) |
-| `duration_norm` | time / 30 s, capped at 2 |
+| `duration_norm` | min(time / 30 s, 1): a **bounded** normalized duration in [0, 1] |
 
 Loot horizon (`loot_dataset.py`): the **next 3 combat rooms** after a loot event in the same run.
 Non-combat rooms never count. The horizon stops early at death, at victory, or when the run's log ends.
@@ -104,8 +105,14 @@ Non-combat rooms never count. The horizon stops early at death, at victory, or w
 The derived CSV also records progress gained, boss reached, incomplete horizon and termination reason.
 Balance loss = `Σ wᵢ(dᵢ/sᵢ)² / Σ wᵢ`, which is zero inside each target interval. Targets live in
 `experiment_config.json` (`enemy_balance_targets`, `loot_horizon_balance_targets`).
-**The status is PILOT.** `balance.py calibrate` proposes intervals by a pre-specified, controller-agnostic
-rule (pooled q25–q75). Review them, set status to FROZEN, and bump the version before the principal collection.
+Every Q_enemy / Q_loot output is contractually bounded to [0, 1] (probabilities, shares, ratios and
+normalized durations), and the networks enforce that bound by construction.
+
+The ordinary-room targets are **design-intent** values: death [0, 0.08], post_hp [0.35, 0.85],
+damage_share [0.09, 0.31], combat_efficiency [0.15, 0.50], duration_norm [0.10, 0.50]. They are
+**not** pilot quantiles. `balance.py audit` checks them component by component: zero loss inside,
+smooth increasing loss outside, the normalization identity, and empirical contribution shares.
+Boss outcomes are not part of the ordinary-room utility.
 
 ## Equipment audit (human game vs. bot)
 
@@ -114,7 +121,7 @@ rule (pooled q25–q75). Review them, set status to FROZEN, and bump the version
 | weapon | Sword dmg 14, cd 1.00, heal 1.00; Hatchet 20, 1.12, 1.05; Rapier 10, 0.80, 0.95 | loot UI (E at pedestal, arrows, Enter) | dmg per melee hit; melee cooldown `0.45·cd`; heal on kill `int(8·heal_mult)` | same dmg; exchange time `0.35 s·cd`; same heal (shared function) |
 | spell | Magic Bolt dmg 10, cd 1.00, ammo 12; Magic Spike 8, 0.78, 16; Hex Bomb 30, 1.25, 9 | loot UI (ammo refilled on pick) | projectile dmg; magic cooldown `0.60·cd`; ammo per room (refilled on entry) | same dmg; exchange time `0.35 s·cd`; ammo per room, melee once empty |
 | armor | Cloth Wrap absorb 0.5, heal +0; Chain Shirt 2.0, +0; Blood Harness 1.0, +6 | loot UI | flat absorb per hit before the defend multiplier; heal bonus on kill | identical (`dda_core.incoming_damage`, `heal_on_kill_amount`) |
-| boots | Leather 1.00; Sprint Greaves 1.25; Voidstep Treads 1.45 (`dash_dist_mult`) | loot UI | **none**: `dash_dist_mult` is only displayed; the dash is always `DASH_SPEED·DASH_TIME` | **inert** (no bot-only meaning) |
+| boots | Leather 1.00; Sprint Greaves 1.25; Voidstep Treads 1.45 (`dash_dist_mult`) | loot UI | dash distance `600·0.12·mult` = 72 / 90 / 104 px (speed scaled, `DASH_TIME` and `DASH_CD` unchanged). Before game 0.6.0 the stat was displayed but never applied (fixed defect) | the bot dashes with archetype `p_dash` under `DASH_CD`; a dash spends the exchange moving and evades the incoming ram with p = min(1, dash distance / enemy ram distance) |
 
 Both the game and the bot call the same `dda_core` item functions. The starting loadout is one
 uniform item per slot, derived from `run_seed` in both.
@@ -124,9 +131,14 @@ The bot's abstract resolver uses these documented approximations:
 - Melee hits a single target.
 - A cooldown scales the exchange duration and the enemy's per-exchange hit chance.
 - Hit and damage variation is ±15%.
+- A dash's avoidance value is its distance relative to the enemy ram's reach
+  (`ENEMY_SPEED·speed_mult·ENEMY_DASH_SPEED_MULT·ENEMY_DASH_TIME`).
 
-`tests/test_equipment.py` checks that representative items change the corresponding bot variables,
-and that boots do not.
+`tests/test_equipment.py` checks the following:
+- Representative items change the corresponding bot variables.
+- Each boot produces its declared dash distance in the game logic.
+- The bot consumes the same `Boots` definition, with no bot-only statistic.
+- Better boots raise evasions and lower damage taken in the bot.
 
 ## Active pipeline
 
@@ -163,8 +175,8 @@ pytest -q
 
 ```bash
 EXP=experiments/$(date +%Y%m%d)_main
-scripts/01_smoke.sh $EXP          # compile, pytest, pilot (3 controllers × exploration rewards), loot dataset, calibration
-#   -> set enemy/loot targets from the review, status FROZEN, bump version, commit
+scripts/01_smoke.sh $EXP          # compile, pytest, pilot (3 controllers × 3 collection reward policies), loot dataset, audit
+#   -> freeze: status FROZEN + commit; python freeze_experiment.py record; commit experiment_freeze.json
 scripts/02_collect.sh $EXP        # seed blocks: MIX (enemy) × REWARD_MIX (reward) -> train_data.csv + train_loot.csv
 scripts/03_train_q.sh $EXP        # Q_enemy seeds (must pass) + Q_loot ablations/gate (result recorded)
 scripts/04_train_cgan.sh $EXP     # cGAN sweep; learned_loot only if the loot gate passed
@@ -197,6 +209,19 @@ Run `i` uses `run_seed = --seed + i`. The map, archetype, starting loadout, comb
 are independent streams derived from it. Results therefore don't depend on `--workers`, and equal seeds
 are paired across conditions.
 
+## Freeze
+
+`freeze_experiment.py record` writes `experiment_freeze.json`. It holds:
+- the commit at which the config was frozen;
+- the schema, DDA, bot-policy and game versions;
+- the config hashes;
+- the targets and weights, `fixed_default`, the shared boss policy and the collection mixtures;
+- the enemy and loot gates (with split seeds), the action-support limits and the 3-room loot horizon.
+
+`scripts/02_collect.sh` runs `freeze_experiment.py verify`. It refuses to collect if any of these
+values, or any contract file, changed after the freeze. `learned_loot` is never used during
+collection; it is trained afterwards only if the predefined Q_loot gate passes on the principal data.
+
 ## Versioning contract
 
 * Changing any `dda_core` tunable (including item stats), the bot policy constants or
@@ -211,8 +236,8 @@ are paired across conditions.
 
 * Bot combat is an abstract resolver. Results describe the bot environment; human sessions are
   analyzed separately.
-* Boots have no functional effect in the game itself, so a learned reward policy can only learn
-  that boots are a weak reward.
+* The bot's dash is an avoidance approximation (it has no positions); the human game applies the
+  exact dash distance.
 * `node_depth_norm` saturates at depth 10, and `total_kills_norm` at 30 kills.
 * Q-predicted balance and utility are model estimates. Claims must rest on observed outcomes
   from equivalent-seed evaluation.

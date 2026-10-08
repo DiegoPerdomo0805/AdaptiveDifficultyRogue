@@ -27,8 +27,10 @@ Horizon outcome columns (h_* feed Q_loot; see balance.LOOT_OUTCOME_COLUMNS):
   cum_damage_taken / cum_damage_dealt
   damage_share           cum taken / (cum taken + cum dealt), 0 if both are 0
   combat_efficiency      cum kills / max(cum hits, 1), 0 with no hits
-  cum_duration_norm      sum of per-room duration_norm
-  duration_norm_per_room cum_duration_norm / observed rooms (0 if none)
+  cum_duration_norm      sum of per-room duration_norm, range [0, 3] (NOT a
+                         bounded [0, 1] quantity; descriptive only, never a
+                         model target)
+  duration_norm_per_room cum_duration_norm / observed rooms (0 if none), in [0, 1]
   progress_gained        progress_norm(last observed room) - progress_norm(loot
                          room); both are "rooms finished before the room"
   boss_reached           1 if a boss room is inside the horizon

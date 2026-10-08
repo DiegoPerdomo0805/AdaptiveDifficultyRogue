@@ -14,27 +14,30 @@ WORKERS="${WORKERS:-4}"
 "$PY" -m compileall -q -x '(\.venv|DATA_AUGMENTATION)' .
 "$PY" -m pytest -q
 for s in bot_runner train_q train_cgan train_q_loot train_loot_policy loot_dataset analyze_loot \
-         evaluate_controllers analyze_results dataset_tools; do
+         evaluate_controllers analyze_results dataset_tools freeze_experiment; do
     "$PY" "$s.py" --help > /dev/null
 done
 
 S=$PILOT_SEED
+P=()
 for c in fixed heuristic exploration; do
-    "$PY" bot_runner.py --runs "$PILOT_RUNS" --seed "$S" --enemy-controller "$c" \
-        --reward-policy "${PILOT_REWARD:-exploration}" --workers "$WORKERS" \
-        --out "$SDIR/pilot_$c.csv" --validate
-    S=$((S + PILOT_RUNS))
+    for r in fixed_uniform heuristic exploration; do       # every collection reward policy
+        "$PY" bot_runner.py --runs "$PILOT_RUNS" --seed "$S" --enemy-controller "$c" \
+            --reward-policy "$r" --workers "$WORKERS" --out "$SDIR/pilot_${c}_${r}.csv" --validate
+        P+=(--csv "$SDIR/pilot_${c}_${r}.csv")
+        S=$((S + PILOT_RUNS))
+    done
 done
-P=("$SDIR/pilot_fixed.csv" "$SDIR/pilot_heuristic.csv" "$SDIR/pilot_exploration.csv")
-"$PY" dataset_tools.py merge --csv "${P[0]}" --csv "${P[1]}" --csv "${P[2]}" --out "$SDIR/pilot_all.csv"
+"$PY" dataset_tools.py merge "${P[@]}" --out "$SDIR/pilot_all.csv"
 "$PY" dataset_tools.py stats --csv "$SDIR/pilot_all.csv" --out "$SDIR/pilot_stats.json" \
     --project-rooms "${PROJECT_ROOMS:-30000}"
 "$PY" loot_dataset.py --csv "$SDIR/pilot_all.csv" --out "$SDIR/pilot_loot.csv"
-"$PY" balance.py calibrate --csv "${P[0]}" --csv "${P[1]}" --csv "${P[2]}" \
+"$PY" balance.py calibrate --csv "$SDIR/pilot_all.csv" \
     --loot-csv "$SDIR/pilot_loot.csv" --out "$SDIR/calibration_report.json"
+"$PY" balance.py audit --csv "$SDIR/pilot_all.csv" --loot-csv "$SDIR/pilot_loot.csv" \
+    --out "$SDIR/target_audit.json"
 "$PY" analyze_loot.py --loot-csv "$SDIR/pilot_loot.csv" --out-dir "$SDIR/loot_descriptive" --bootstrap 300 > /dev/null
 echo
-echo "NEXT: review $SDIR/calibration_report.json (proposed_targets follow the pre-specified rule),"
-echo "      set enemy_balance_targets / loot_horizon_balance_targets in experiment_config.json,"
-echo "      change status to FROZEN, bump experiment_config_version and commit BEFORE 02_collect.sh."
+echo "NEXT: review $SDIR/target_audit.json; targets are design-intent values (not pilot quantiles)."
+echo "      Freeze: status FROZEN + commit, then 'python freeze_experiment.py record' + commit, BEFORE 02_collect.sh."
 stage_done

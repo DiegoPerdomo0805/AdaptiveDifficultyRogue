@@ -26,7 +26,7 @@ def test_q_outputs_bounded_by_architecture_even_for_extreme_inputs():
     ql = models.BoundedOutcomeNet(10, balance.output_ranges("loot")[1:])
     with torch.no_grad():
         yl = models.outcomes_physical(ql(torch.randn(64, 10) * 1e3))
-    assert torch.isfinite(yl).all() and float(yl.max()) <= 2.0 and float(yl.min()) >= 0.0
+    assert torch.isfinite(yl).all() and float(yl.max()) <= 1.0 and float(yl.min()) >= 0.0
 
 
 def test_support_model_threshold_penalty_and_generator_box():
@@ -111,6 +111,8 @@ def test_q_loot_reports_all_ablations_and_matched_gate(loot_setup):
     assert set(rep["variants"]) == {"x", "xe", "xc", "xcie"}
     for v in rep["variants"].values():
         assert set(v["test"]["metrics"]) == set(balance.LOOT_OUTCOME_COLUMNS)
+    for v in rep["variants"].values():
+        assert all(x["inside_physical_range"] for x in v["prediction_ranges"].values())
     comps = rep["gate"]["comparisons"]
     assert comps["xc"]["twin"] == "x" and comps["xcie"]["twin"] == "xe"
     assert loot_setup["rc"] == (0 if rep["gate"]["passed"] else 2)

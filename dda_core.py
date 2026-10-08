@@ -179,10 +179,9 @@ class Spell:
 
 @dataclass(frozen=True)
 class Boots:
-    # NOTE: dash_dist_mult is displayed in rogue.py's loot UI but is NOT read
-    # by any game mechanic (the dash always travels DASH_SPEED * DASH_TIME).
-    # Boots are therefore functionally inert in the human game, and the bot
-    # treats them as inert too (semantic parity; see README equipment audit).
+    # dash_dist_mult scales the dash DISTANCE (dash_distance()). Until
+    # game 0.6.0 it was displayed but never applied (an implementation
+    # defect); both rogue.Player and the bot now consume it.
     name: str
     dash_dist_mult: float
     item_id: str = ""
@@ -274,6 +273,29 @@ def melee_cooldown(weapon: Weapon) -> float:
 
 def magic_cooldown(spell: Spell) -> float:
     return MAGIC_CD_BASE * spell.cd_mult
+
+
+def dash_speed(boots: Boots) -> float:
+    """The dash keeps its duration (DASH_TIME) and scales its speed, so the
+    travelled distance is DASH_SPEED * DASH_TIME * dash_dist_mult."""
+    return DASH_SPEED * boots.dash_dist_mult
+
+
+def dash_distance(boots: Boots) -> float:
+    return dash_speed(boots) * DASH_TIME
+
+
+def enemy_ram_distance(enemy_speed_mult: float) -> float:
+    """Distance an enemy's ram (offensive dash) covers: speed x ram multiplier x ram time."""
+    return ENEMY_SPEED * enemy_speed_mult * ENEMY_DASH_SPEED_MULT * ENEMY_DASH_TIME
+
+
+def dash_evade_probability(boots: Boots, enemy_speed_mult: float) -> float:
+    """Bot approximation of a dash's avoidance value: the share of the
+    incoming ram's reach that the dash moves the player out of, i.e.
+    min(1, dash_distance / enemy_ram_distance). Uses only the fixed boot
+    statistic and existing game constants (no bot-only item statistic)."""
+    return clamp(dash_distance(boots) / max(enemy_ram_distance(enemy_speed_mult), 1e-6), 0.0, 1.0)
 
 # ---------------------------------------------------------------------------
 # Combat metrics + condition vector (THE single definition)
@@ -633,6 +655,7 @@ def config_hash(extra: Optional[dict] = None) -> str:
 
         "ITEMS": _item_table(),
         "HEAL_ON_KILL_BASE": HEAL_ON_KILL_BASE,
+        "DASH_SPEED": DASH_SPEED, "DASH_TIME": DASH_TIME, "DASH_CD": DASH_CD,
         "DEFEND_DMG_MULT": DEFEND_DMG_MULT,
         "LOOT_BIAS_KNIGHT": LOOT_BIAS_KNIGHT,
         "LOOT_BIAS_BERSERKER": LOOT_BIAS_BERSERKER,

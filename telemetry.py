@@ -53,11 +53,12 @@ import dda_core as core
 # v3.0: controller identity/fallback columns, run_seed, player_profile,
 # post_hp_ratio, experiment_config_version; cumulative total_kills_norm.
 SCHEMA_VERSION = "room_samples_v4.0"
-GAME_VERSION = "0.5.0"          # items now have functional parity in the bot
+GAME_VERSION = "0.6.0"          # boots' dash_dist_mult now applied (game + bot)
 GENERATOR_VERSION = "node_map_gen_v1"
 # v3: equipment-aware abstract combat, seeded starting loadout, offers
 # generated once per loot room by the reward policy, shared boss policy.
-BOT_POLICY_VERSION = "dfs_backtrack_v3"
+# v4: bot dash (boots' dash_dist_mult) with DASH_CD and ram-evasion approximation.
+BOT_POLICY_VERSION = "dfs_backtrack_v4"
 DDA_VERSION = "rule_based_dda_v1.2"    # matches dda_core's v1.2 condition contract
 
 COND_DIM = core.COND_DIM     # 9 -- single source of truth is dda_core

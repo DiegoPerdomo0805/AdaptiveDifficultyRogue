@@ -2,8 +2,7 @@
 # Stage B -- principal collection in isolated, validated seed blocks.
 #   scripts/02_collect.sh <exp_dir>
 # Env: RUNS (total, default 9000 ~ 30k combat rooms), BLOCK_RUNS (default 1500),
-#      MIX (enemy controllers, default exploration=0.65,heuristic=0.20,fixed=0.15),
-#      REWARD_MIX (reward policies, default exploration=0.60,heuristic=0.20,fixed_uniform=0.20),
+#      MIX / REWARD_MIX (default: experiment_config.principal_collection; learned_loot refused),
 #      SEED (default: start of seed_blocks.train_collection), WORKERS (default 6),
 #      ALLOW_PILOT_CONFIG=1 to collect with a non-FROZEN experiment config (NOT for the thesis).
 source "$(dirname "$0")/common.sh"
@@ -11,14 +10,16 @@ usage_exp "$@"
 stage_begin "$1" 02_collect "$@"
 cd "$REPO"
 STATUS="$(json_get experiment_config.json 'd["status"].split(":")[0]')"
-if [ "$STATUS" != "FROZEN" ] && [ "${ALLOW_PILOT_CONFIG:-0}" != "1" ]; then
-    die "experiment_config.json status is '$STATUS', not FROZEN. Calibrate and freeze targets first."
+if [ "${ALLOW_PILOT_CONFIG:-0}" != "1" ]; then
+    [ "$STATUS" = "FROZEN" ] || die "experiment_config.json status is '$STATUS', not FROZEN."
+    "$PY" freeze_experiment.py verify || die "freeze verification failed"
 fi
 [ -z "$(git status --porcelain --untracked-files=no)" ] || [ "${ALLOW_DIRTY:-0}" = "1" ] \
     || die "working tree has uncommitted changes; commit before the dataset freeze (ALLOW_DIRTY=1 overrides)."
 RUNS="${RUNS:-9000}"; BLOCK_RUNS="${BLOCK_RUNS:-1500}"; WORKERS="${WORKERS:-6}"
-MIX="${MIX:-exploration=0.65,heuristic=0.20,fixed=0.15}"
-REWARD_MIX="${REWARD_MIX:-exploration=0.60,heuristic=0.20,fixed_uniform=0.20}"
+MIX="${MIX:-$(json_get experiment_config.json 'd["principal_collection"]["enemy_controller_mix"]')}"
+REWARD_MIX="${REWARD_MIX:-$(json_get experiment_config.json 'd["principal_collection"]["reward_policy_mix"]')}"
+case "$REWARD_MIX" in *learned_loot*) die "learned_loot is never used during collection" ;; esac
 SEED="${SEED:-$(json_get experiment_config.json 'd["seed_blocks"]["train_collection"][0]')}"
 MAXSEED="$(json_get experiment_config.json 'd["seed_blocks"]["train_collection"][1]')"
 [ $((SEED + RUNS - 1)) -le "$MAXSEED" ] || die "seed range exceeds seed_blocks.train_collection"

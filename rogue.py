@@ -349,8 +349,10 @@ class Player:
 
         if self.dashing:
             self.dash_t += dt
-            self.x += self.dash_dir[0] * DASH_SPEED * dt
-            self.y += self.dash_dir[1] * DASH_SPEED * dt
+            # Boots' dash_dist_mult scales the dash distance (shared with the bot).
+            speed = core.dash_speed(self.boots)
+            self.x += self.dash_dir[0] * speed * dt
+            self.y += self.dash_dir[1] * speed * dt
             if self.dash_t >= DASH_TIME:
                 self.dashing = False
                 self.dash_t = 0.0

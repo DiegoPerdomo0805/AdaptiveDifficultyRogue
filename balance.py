@@ -23,7 +23,8 @@ Enemy outcome vector (order is part of the checkpoint contract):
                      0 when both are 0 (bounded monotone transform r/(1+r) of
                      the taken/dealt ratio).
   combat_efficiency  kills / max(hits, 1) in [0, 1]; 0 when no hit landed.
-  duration_norm      time_in_room / duration_norm_seconds, in [0, cap].
+  duration_norm      min(time_in_room / duration_norm_seconds, 1) in [0, 1]
+                     (bounded normalized duration; rooms longer than 30 s saturate).
 
 Loot-horizon outcome vector: death_within, end_hp_ratio, damage_share,
 combat_efficiency, duration_norm_per_room (see loot_dataset.py).
@@ -96,6 +97,8 @@ def _validate_config(cfg: dict):
         raise ExperimentConfigError(f"outcomes.columns must be {OUTCOME_COLUMNS}")
     if cfg["loot_horizon"].get("columns") != LOOT_OUTCOME_COLUMNS:
         raise ExperimentConfigError(f"loot_horizon.columns must be {LOOT_OUTCOME_COLUMNS}")
+    if float(cfg["outcomes"].get("duration_norm_cap", 0)) != 1.0:
+        raise ExperimentConfigError("duration_norm is a bounded normalized outcome: duration_norm_cap must be 1.0")
     if int(cfg["loot_horizon"].get("combat_rooms", 0)) != 3:
         raise ExperimentConfigError("loot_horizon.combat_rooms is fixed at 3 by the project scope")
     for fam in FAMILIES.values():
@@ -113,10 +116,10 @@ def _validate_config(cfg: dict):
 
 def output_ranges(family: str = "enemy", cfg: Optional[dict] = None) -> List[tuple]:
     """Physical (low, high) range of each outcome, aligned with the family's
-    columns. Binary outcomes are probabilities in [0, 1]."""
-    cfg = cfg or load_experiment_config()
-    cap = float(cfg["outcomes"]["duration_norm_cap"])
-    return [(0.0, cap) if c.startswith("duration") else (0.0, 1.0) for c in FAMILIES[family]["columns"]]
+    columns. Every model output is contractually bounded to [0, 1]: binary
+    outcomes are probabilities, the others are ratios / shares / normalized
+    durations (duration_norm_cap is validated to be 1.0)."""
+    return [(0.0, 1.0) for _ in FAMILIES[family]["columns"]]
 
 
 def target_arrays(cfg: Optional[dict] = None, family: str = "enemy"):
@@ -302,6 +305,91 @@ def calibration_report(csv_paths: List[str], cfg: Optional[dict] = None,
     return report
 
 
+# ---------------------------------------------------------------------------
+# Target component-contribution audit (pre-freeze)
+# ---------------------------------------------------------------------------
+
+def target_audit(cfg: Optional[dict] = None, family: str = "enemy",
+                 vectors: Optional[Dict[str, List[List[float]]]] = None) -> dict:
+    """
+    Analytic + empirical audit of the balance loss for one family.
+
+    Analytic (per component i, others held at their interval midpoints):
+      zero_inside        max loss over a 101-point grid of [low, high] is 0
+      positive_below/above, increasing_below/above
+                         loss > 0 and strictly increasing as the value moves
+                         away from the interval (sampled to the physical bound)
+      c1_at_bounds       one-sided derivative at each bound is 0 (smooth join)
+      one_scale_loss     loss exactly one `scale` outside = w_i / sum(w)
+                         (normalization identity)
+      max_loss_below/above  loss at the physical bound (exposes range effects)
+
+    Empirical (optional `vectors`: {label: [outcome vectors]}, binary column as
+    a probability or rate): mean contribution share of each component, share
+    of vectors where the component is outside its interval, and flags:
+      dominant   share > 0.80
+      inactive   share < 0.02 and outside-fraction < 0.02
+    """
+    cfg = cfg or load_experiment_config()
+    cols = FAMILIES[family]["columns"]
+    low, high, scale, weight = target_arrays(cfg, family)
+    ranges = output_ranges(family, cfg)
+    wsum = sum(weight)
+    mid = [(lo + hi) / 2 for lo, hi in zip(low, high)]
+
+    def loss_with(i, v):
+        y = list(mid)
+        y[i] = v
+        return balance_distance(y, cfg, family)
+
+    comps = {}
+    for i, col in enumerate(cols):
+        lo, hi, s = low[i], high[i], scale[i]
+        plo, phi = ranges[i]
+        inside = [lo + (hi - lo) * k / 100 for k in range(101)]
+        below = [lo - (lo - plo) * k / 50 for k in range(1, 51)] if lo > plo else []
+        above = [hi + (phi - hi) * k / 50 for k in range(1, 51)] if hi < phi else []
+        lb, la = [loss_with(i, v) for v in below], [loss_with(i, v) for v in above]
+        eps = 1e-6
+        comps[col] = {
+            "interval": [lo, hi], "scale": s, "weight": weight[i], "normalized_weight": weight[i] / wsum,
+            "physical_range": list(ranges[i]),
+            "zero_inside": max(loss_with(i, v) for v in inside) == 0.0,
+            "positive_below": all(x > 0 for x in lb) if lb else None,
+            "increasing_below": all(b > a for a, b in zip(lb, lb[1:])) if lb else None,
+            "positive_above": all(x > 0 for x in la) if la else None,
+            "increasing_above": all(b > a for a, b in zip(la, la[1:])) if la else None,
+            "c1_at_bounds": abs(loss_with(i, lo - eps) - loss_with(i, lo)) / eps < 1e-4
+                            and abs(loss_with(i, hi + eps) - loss_with(i, hi)) / eps < 1e-4,
+            "one_scale_loss": loss_with(i, hi + s) if hi + s <= phi + 1e-9 else loss_with(i, lo - s),
+            "one_scale_identity_ok": abs((loss_with(i, hi + s) if hi + s <= phi + 1e-9 else loss_with(i, lo - s))
+                                         - weight[i] / wsum) < 1e-9,
+            "max_loss_below": loss_with(i, plo) if lo > plo else 0.0,
+            "max_loss_above": loss_with(i, phi) if hi < phi else 0.0,
+            "lower_bound_active": lo > plo,
+            "upper_bound_active": hi < phi,
+        }
+    out = {"family": family, "targets_section": FAMILIES[family]["targets"], "weight_sum": wsum,
+           "components": comps, "empirical": {}}
+    for label, ys in (vectors or {}).items():
+        if not ys:
+            continue
+        terms = [balance_terms(y, cfg, family) for y in ys]
+        tot = sum(sum(t) for t in terms)
+        e = {"n": len(ys), "mean_balance_distance": tot / wsum / len(ys), "components": {}}
+        for i, col in enumerate(cols):
+            share = (sum(t[i] for t in terms) / tot) if tot > 0 else 0.0
+            outside = sum(1 for y in ys if not (low[i] <= y[i] <= high[i])) / len(ys)
+            e["components"][col] = {"share": share, "outside_fraction": outside,
+                                    "dominant": share > 0.80, "inactive": share < 0.02 and outside < 0.02}
+        out["empirical"][label] = e
+    out["analytic_ok"] = all(c["zero_inside"] and c["c1_at_bounds"] and c["one_scale_identity_ok"]
+                             and c["positive_below"] is not False and c["increasing_below"] is not False
+                             and c["positive_above"] is not False and c["increasing_above"] is not False
+                             for c in comps.values())
+    return out
+
+
 def _print_family(name: str, rep: dict):
     print(f"== {name} ==")
     for grp, e in rep["by_policy"].items():
@@ -325,6 +413,11 @@ def main(argv=None):
     c.add_argument("--loot-csv", action="append", default=[], help="loot_dataset.py output (repeatable).")
     c.add_argument("--out", default=None, help="Write the JSON report here.")
     sub.add_parser("show", help="Print the current experiment config version/hash and targets.")
+    au = sub.add_parser("audit", help="Target component-contribution audit (analytic + empirical).")
+    au.add_argument("--csv", action="append", default=[], help="room telemetry for empirical shares")
+    au.add_argument("--loot-csv", action="append", default=[], help="loot dataset for empirical shares")
+    au.add_argument("--q-dir", default=None, help="Q_enemy dir: also audit Q-predicted (probability) vectors")
+    au.add_argument("--out", default=None)
     args = ap.parse_args(argv)
 
     cfg = load_experiment_config()
@@ -334,6 +427,8 @@ def main(argv=None):
                           "enemy_balance_targets": cfg["enemy_balance_targets"],
                           "loot_horizon_balance_targets": cfg["loot_horizon_balance_targets"]}, indent=2))
         return 0
+    if args.cmd == "audit":
+        return _run_audit(args, cfg)
     report = calibration_report(args.csv, cfg, args.loot_csv)
     if args.out:
         with open(args.out, "w") as f:
@@ -343,6 +438,70 @@ def main(argv=None):
     if "loot" in report:
         _print_family("loot horizon (next 3 combat rooms)", report["loot"])
     return 0
+
+
+def _rate_vectors(rows: List[List[float]], groups: List[str]) -> List[List[float]]:
+    """Group-level mean outcome vectors (binary column becomes a rate)."""
+    by: Dict[str, List[List[float]]] = {}
+    for y, g in zip(rows, groups):
+        by.setdefault(g, []).append(y)
+    return [[sum(v[j] for v in ys) / len(ys) for j in range(len(ys[0]))] for ys in by.values()]
+
+
+def _run_audit(args, cfg) -> int:
+    enemy_vecs, loot_vecs = {}, {}
+    rows = []
+    for p in args.csv:
+        with open(p, newline="") as f:
+            rows.extend(r for r in csv.DictReader(f) if r["room_kind"] == "enemy")
+    if rows:
+        ys = [outcome_vector(r, cfg) for r in rows]
+        enemy_vecs["observed per room (0/1 death)"] = ys
+        enemy_vecs["observed per run (death rate)"] = _rate_vectors(ys, [r["run_id"] for r in rows])
+        enemy_vecs["observed per controller x depth (death rate)"] = _rate_vectors(
+            ys, [r["enemy_controller"] + ":" + r["node_depth"] for r in rows])
+        if args.q_dir:
+            import torch
+            import ml_data
+            import models
+            ck = torch.load(os.path.join(args.q_dir, "q_checkpoint.pt"), map_location="cpu", weights_only=True)
+            q = models.freeze(models.OutcomeModel(**ck["q_xa_hparams"]))
+            q.load_state_dict(ck["q_xa_state"])
+            sc = ml_data.Standardizer.from_json(ck["cond_scaler"])
+            x = torch.tensor(sc.transform(ml_data.cond_matrix(rows)), dtype=torch.float32)
+            a = torch.tensor([ml_data.normalize_action(v) for v in ml_data.action_matrix(rows)], dtype=torch.float32)
+            with torch.no_grad():
+                enemy_vecs["Q-predicted per room (P(death))"] = models.outcomes_physical(q(x, a)).tolist()
+    for p in args.loot_csv:
+        with open(p, newline="") as f:
+            ev = [r for r in csv.DictReader(f) if r["selected_category"] != "none" and int(r["horizon_combat_rooms"]) >= 1]
+        lys = [[float(r["h_" + c]) for c in LOOT_OUTCOME_COLUMNS] for r in ev]
+        loot_vecs["observed per event (0/1 death)"] = lys
+        loot_vecs["observed per reward policy x category (death rate)"] = _rate_vectors(
+            lys, [r["reward_policy"] + ":" + r["selected_category"] for r in ev])
+    rep = {"experiment_config_version": cfg["experiment_config_version"],
+           "experiment_config_hash": experiment_config_hash(cfg),
+           "enemy": target_audit(cfg, "enemy", enemy_vecs), "loot": target_audit(cfg, "loot", loot_vecs)}
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(rep, f, indent=2)
+    for fam in ("enemy", "loot"):
+        a = rep[fam]
+        print(f"== {fam} ({a['targets_section']}), weight sum {a['weight_sum']}, analytic checks "
+              f"{'PASS' if a['analytic_ok'] else 'FAIL'}")
+        print(f"   {'component':22s} {'interval':14s} {'scale':>6s} {'w/sum':>6s} {'1-scale':>8s} "
+              f"{'maxL<':>7s} {'maxL>':>7s} zero_in C1 incr<  incr>")
+        for col, c in a["components"].items():
+            print(f"   {col:22s} [{c['interval'][0]:.2f},{c['interval'][1]:.2f}]    {c['scale']:6.3f} "
+                  f"{c['normalized_weight']:6.3f} {c['one_scale_loss']:8.4f} {c['max_loss_below']:7.3f} "
+                  f"{c['max_loss_above']:7.3f} {str(c['zero_inside']):7s} {str(c['c1_at_bounds']):5s} "
+                  f"{str(c['increasing_below']):6s} {str(c['increasing_above'])}")
+        for label, e in a["empirical"].items():
+            cells = "  ".join(f"{col}:{v['share']:.2f}/{v['outside_fraction']:.2f}"
+                              + ("[DOMINANT]" if v["dominant"] else "") + ("[inactive]" if v["inactive"] else "")
+                              for col, v in e["components"].items())
+            print(f"   [{label}] n={e['n']} mean L={e['mean_balance_distance']:.4f}\n      share/outside: {cells}")
+    return 0 if rep["enemy"]["analytic_ok"] and rep["loot"]["analytic_ok"] else 1
 
 
 if __name__ == "__main__":

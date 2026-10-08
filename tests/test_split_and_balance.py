@@ -79,3 +79,49 @@ def test_experiment_config_targets_not_in_model_code():
     cfg = balance.load_experiment_config()
     for col, t in {**cfg["enemy_balance_targets"], **cfg["loot_horizon_balance_targets"]}.items():
         assert f'"{col}": {{"low"' not in src
+
+
+def test_duration_norm_is_bounded_normalized():
+    r = _row(time_in_room=500.0)
+    assert balance.outcome_vector(r)[4] == 1.0
+    assert balance.duration_norm(15.0) == pytest.approx(0.5)
+    assert all(rng == (0.0, 1.0) for rng in balance.output_ranges("enemy"))
+    assert all(rng == (0.0, 1.0) for rng in balance.output_ranges("loot"))
+
+
+def test_target_audit_analytic_properties():
+    for fam in ("enemy", "loot"):
+        a = balance.target_audit(family=fam)
+        assert a["analytic_ok"]
+        for c in a["components"].values():
+            assert c["zero_inside"] and c["c1_at_bounds"] and c["one_scale_identity_ok"]
+            assert c["positive_above"] in (True, None) and c["increasing_above"] in (True, None)
+            assert c["positive_below"] in (True, None) and c["increasing_below"] in (True, None)
+        assert sum(c["normalized_weight"] for c in a["components"].values()) == pytest.approx(1.0)
+
+
+def test_design_intent_enemy_targets_are_the_frozen_values():
+    t = balance.load_experiment_config()["enemy_balance_targets"]
+    assert {k: (v["low"], v["high"]) for k, v in t.items()} == {
+        "death": (0.0, 0.08), "post_hp_ratio": (0.35, 0.85), "damage_share": (0.09, 0.31),
+        "combat_efficiency": (0.15, 0.50), "duration_norm": (0.10, 0.50)}
+
+
+def test_fixed_default_is_the_documented_neutral_configuration():
+    import controllers
+    import dda_core as core
+    fx = balance.load_experiment_config()["enemy_controller"]["fixed"]
+    assert fx["name"] == "fixed_default"
+    assert fx["action"] == {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0,
+                            "spawn_count": core.DDA_SPAWN_BASE}
+    d = controllers.make_controller("fixed").decide(
+        controllers.DecisionContext([0.5] * 9, core.CombatMetrics(melee_kills=40), 7, 0.1, "enemy"))
+    assert {k: d.action[k] for k in core.ACTION_KEYS} == fx["action"]     # state-independent
+
+
+def test_principal_collection_mixture_excludes_learned_loot():
+    import bot_runner
+    pc = balance.load_experiment_config()["principal_collection"]
+    rmix = bot_runner.parse_mix_spec(pc["reward_policy_mix"], ("fixed_uniform", "heuristic", "exploration",
+                                                               "learned_loot"))
+    assert set(rmix) == {"fixed_uniform", "heuristic", "exploration"} and pc["learned_loot_allowed"] is False

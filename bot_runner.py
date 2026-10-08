@@ -52,9 +52,13 @@ holds one fixed item per slot (seeded uniform starting loadout, as rogue.py)
 and applies the SAME item effects through dda_core's shared functions:
 weapon dmg / cd_mult / heal_mult, spell dmg / cd_mult / ammo_max (refilled on
 each room entry), armor dmg_absorb / heal_on_kill_bonus. Boots are inert in
-both (dash_dist_mult is not read by any game mechanic). Documented
-approximations of the abstract resolver: one enemy engages at a time, melee
-hits a single target, and cooldowns scale the exchange duration.
+both (dash_dist_mult scales the dash distance in rogue.py). The bot's
+dash (archetype p_dash, game DASH_CD) spends an exchange moving instead of
+attacking and evades the incoming ram with probability
+dda_core.dash_evade_probability = min(1, dash distance / enemy ram distance).
+Documented approximations of the abstract resolver: one enemy engages at a
+time, melee hits a single target, cooldowns scale the exchange duration,
+and a dash's avoidance value is its distance relative to the ram's reach.
 
 Loot rooms: the run's reward policy (rewards.py) proposes category
 probabilities, 3 offers are drawn once, the bot picks one uniformly with its
@@ -106,7 +110,7 @@ BOT_RUNNER_VERSION_EXTRA = {
     "RECENT_WINDOW_ROOMS": telemetry.RECENT_WINDOW_ROOMS,
     "node_count": 16, "cols": 6, "rows": 6, "extra_loops": 2,
     "enemy_weight": 0.55, "loot_weight": 0.22,
-    "combat_model": "equipment_v3",
+    "combat_model": "equipment_v4_dash",
     "BOT_EXCHANGE_SEC": BOT_EXCHANGE_SEC, "BOT_BASE_HIT_CHANCE": BOT_BASE_HIT_CHANCE,
     "BOT_DEFEND_HIT_CHANCE": BOT_DEFEND_HIT_CHANCE,
     "BOT_INCOMING_PER_EXCHANGE": BOT_INCOMING_PER_EXCHANGE, "BOT_MAX_EXCHANGES": BOT_MAX_EXCHANGES,
@@ -152,6 +156,8 @@ class BotPlayer:
     max_hp: float = PLAYER_MAX_HP
     hp: float = PLAYER_MAX_HP
     metrics: core.CombatMetrics = field(default_factory=core.CombatMetrics)
+    dashes: int = 0                  # diagnostics only (not logged)
+    evaded_hits: int = 0
 
     def hp_ratio(self) -> float:
         return core.clamp(self.hp / self.max_hp, 0.0, 1.0)
@@ -189,23 +195,32 @@ def _simulate_combat_room(
     enemy_dmg = core.ENEMY_BASE_DMG * cfg["enemy_dmg_mult"]
     enemy_speed_factor = cfg["enemy_speed_mult"]
 
+    evade_p = core.dash_evade_probability(eq.boots, enemy_speed_factor)
+    dash_cd_left = 0.0                      # dash cooldown carries the game's DASH_CD
     exchanges = 0
     while enemies_left > 0 and player.hp > 0 and exchanges < BOT_MAX_EXCHANGES:
         exchanges += 1
         roll = rng.random()
         use_magic = roll < arch.p_magic and ammo > 0
         use_defend = (not use_magic) and arch.p_magic <= roll < arch.p_magic + arch.p_defend
+        wants_dash = arch.p_magic + arch.p_defend <= roll < arch.p_magic + arch.p_defend + arch.p_dash
+        use_dash = wants_dash and dash_cd_left <= 0.0      # on cooldown -> attack in melee instead
 
-        if use_magic:
+        if use_dash:
+            cd_mult, base_dmg = 1.0, 0.0      # the exchange is spent dashing, no attack
+            dash_cd_left = core.DASH_CD
+        elif use_magic:
             ammo -= 1                       # a cast consumes ammo whether or not it hits
             cd_mult, base_dmg = eq.spell.cd_mult, eq.spell.dmg
         else:
             cd_mult, base_dmg = eq.weapon.cd_mult, eq.weapon.dmg
         exchange_sec = BOT_EXCHANGE_SEC * cd_mult
         player.metrics.time_alive += exchange_sec
+        dash_cd_left = max(0.0, dash_cd_left - exchange_sec)   # elapses with time, as in rogue.py
+        player.dashes += int(use_dash)
 
         hit_chance = BOT_DEFEND_HIT_CHANCE if use_defend else BOT_BASE_HIT_CHANCE
-        if rng.random() < hit_chance:
+        if not use_dash and rng.random() < hit_chance:
             dmg = base_dmg * rng.uniform(0.85, 1.15)
             if use_magic:
                 player.metrics.magic_hits += 1
@@ -226,6 +241,9 @@ def _simulate_combat_room(
         # queued); its hit chance is proportional to the exchange duration.
         incoming_chance = BOT_INCOMING_PER_EXCHANGE * enemy_speed_factor * (exchange_sec / BOT_EXCHANGE_SEC)
         if enemies_left > 0 and rng.random() < core.clamp(incoming_chance, 0.03, 0.85):
+            if use_dash and rng.random() < evade_p:
+                player.evaded_hits += 1           # the dash carried the player out of the ram
+                continue
             player.receive_hit(enemy_dmg * rng.uniform(0.8, 1.2), defending=use_defend)
             if player.hp <= 0:
                 break

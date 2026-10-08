@@ -98,16 +98,75 @@ def test_heal_on_kill_uses_weapon_and_armor():
     assert p.hp == 50.0 + 8 + 6
 
 
-def test_boots_are_inert_in_game_and_bot():
-    """dash_dist_mult is not read by any game mechanic, so boots must not
-    change bot combat either (no artificial bot-only meaning)."""
-    import inspect
+class _Keys(dict):
+    def __missing__(self, k):
+        return False
+
+
+def _game_dash_distance(boots_id, dt=0.04):
+    import pygame
     import rogue
-    assert "dash_dist_mult" not in inspect.getsource(rogue.Player)
-    for s in range(20):
-        a = room(eq(boots="boots.leather"), MELEE, s)[2]
-        b = room(eq(boots="boots.voidstep_treads"), MELEE, s)[2]
-        assert a == b
+    pl = rogue.Player(400, 270, equipment=eq(boots=boots_id))
+    pl.facing_deg = 0.0
+    arena = pygame.Rect(-10000, -10000, 20000, 20000)       # no wall clipping
+    x0 = pl.x
+    pl.try_dash()
+    while pl.dashing:
+        pl.update(dt, _Keys(), arena)
+    return pl.x - x0
+
+
+@pytest.mark.parametrize("boots_id", sorted(B))
+def test_each_boot_scales_the_human_game_dash_distance(boots_id, monkeypatch):
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    pytest.importorskip("pygame")
+    d = _game_dash_distance(boots_id)
+    base = _game_dash_distance("boots.leather")
+    assert d / base == pytest.approx(B[boots_id].dash_dist_mult, rel=1e-9)
+    assert d == pytest.approx(core.dash_distance(B[boots_id]), rel=0.35)   # frame quantization of DASH_TIME
+
+
+def test_bot_consumes_the_same_boot_definition_and_no_bot_only_stat():
+    import dataclasses
+    assert [f.name for f in dataclasses.fields(core.Boots)] == ["name", "dash_dist_mult", "item_id"]
+    for b in core.BOOTS:
+        assert core.dash_distance(b) == pytest.approx(core.DASH_SPEED * core.DASH_TIME * b.dash_dist_mult)
+    # the bot's evasion is a pure function of the boot item and game constants
+    vals = [core.dash_evade_probability(b, 1.15) for b in core.BOOTS]
+    assert vals == sorted(vals) and vals[0] < vals[-1]
+    import inspect
+    src = inspect.getsource(bot_runner._simulate_combat_room)
+    assert "dash_evade_probability(eq.boots" in src and "dash_dist_mult" not in src
+
+
+def test_bot_boots_change_mobility_relevant_combat_quantities():
+    dasher = bot_runner.Archetype("t_dash", "melee", 0.5, 0.0, 0.0, 0.5, [0.25] * 4)
+    cfg = dict(CFG, enemy_speed_mult=1.6)
+    stats = {}
+    for bid in ("boots.leather", "boots.voidstep_treads"):
+        ev = dashes = 0
+        taken = 0.0
+        for s in range(300):
+            p, _, d = room(eq(boots=bid), dasher, s, cfg, hp=1e9)
+            ev += p.evaded_hits
+            dashes += p.dashes
+            taken += d["damage_taken"]
+        stats[bid] = (ev / dashes, taken)
+    # only dashes that coincide with an incoming ram can evade, so evasions per
+    # dash scale with the configured evade probabilities (0.547 vs 0.793 here)
+    ratio = stats["boots.voidstep_treads"][0] / stats["boots.leather"][0]
+    expected = (core.dash_evade_probability(B["boots.voidstep_treads"], 1.6)
+                / core.dash_evade_probability(B["boots.leather"], 1.6))
+    assert ratio == pytest.approx(expected, rel=0.15)
+    assert stats["boots.voidstep_treads"][1] < stats["boots.leather"][1]         # less damage taken
+
+
+def test_dash_respects_the_game_cooldown():
+    dasher = bot_runner.Archetype("t_dash_only", "melee", 0.0, 0.0, 0.0, 1.0, [0.25] * 4)
+    p, _, d = room(eq(), dasher, 0, dict(CFG, spawn_count=2), hp=1e9)
+    # between dashes the bot must attack (cooldown DASH_CD > exchange time)
+    assert p.dashes > 0 and d["melee_hits"] > 0
+    assert p.dashes <= d["time_in_room"] / core.DASH_CD + 1
 
 
 def test_game_player_uses_the_same_item_functions(monkeypatch):
