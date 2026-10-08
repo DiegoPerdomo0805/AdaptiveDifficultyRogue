@@ -63,6 +63,14 @@ def test_equivalent_seed_evaluation_end_to_end(trained, tmp_path):
     assert "boss_survival" in s["controllers"]["cgan"]["metrics"]
     pvo = s["predicted_vs_observed"]["by_condition"]
     assert set(pvo) == {"fixed", "heuristic", "cgan"}
+    rl = s["predicted_vs_observed"]["run_level"]
+    assert set(rl) == {"fixed", "heuristic", "cgan"} and "B_r" in rl["cgan"]
+    for c in s["controllers"].values():            # primary metric: run-level B_r distribution
+        p = c["primary"]
+        assert p["n_runs_with_ordinary_rooms"] + p["n_runs_excluded"] == 20
+        assert p["mean_ci"][0] <= p["mean"] <= p["mean_ci"][1]
+    assert set(s["primary_ranking"]) == {"fixed", "heuristic", "cgan"}
+    assert s["primary_paired"]["vs_heuristic"]["cgan"]["n_pairs"] > 0
     seeds = {c: sorted({r["run_seed"] for r in csv.DictReader(open(out / f"eval_{c}.csv"))})
              for c in ("fixed", "heuristic", "cgan")}
     assert seeds["fixed"] == seeds["heuristic"] == seeds["cgan"]

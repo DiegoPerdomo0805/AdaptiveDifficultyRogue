@@ -61,6 +61,23 @@ def group_runs(rows, key: str = "enemy_controller") -> Dict[str, Dict[str, List[
     return out
 
 
+RUN_LEVEL_COLUMNS = ["death_rate", "post_hp_mean", "damage_share_agg", "efficiency_agg", "duration_mean"]
+
+
+def run_level_vector(combat: List[dict], cfg) -> List[float]:
+    """THE run-level aggregation of ordinary combat rooms (primary metric;
+    experiment_config.primary_metric): [death rate, mean post-room HP (0 for a
+    fatal room), summed damage share, summed efficiency, mean duration_norm]."""
+    n = len(combat)
+    ys = [balance.outcome_vector(r, cfg) for r in combat]
+    taken = sum(float(r["damage_taken_in_room"]) for r in combat)
+    dealt = sum(float(r["damage_dealt_in_room"]) for r in combat)
+    kills = sum(float(r["melee_kills_in_room"]) + float(r["magic_kills_in_room"]) for r in combat)
+    hits = sum(float(r["melee_hits_in_room"]) + float(r["magic_hits_in_room"]) for r in combat)
+    return [sum(y[0] for y in ys) / n, sum(y[1] for y in ys) / n, balance.damage_share(taken, dealt),
+            balance.combat_efficiency(kills, hits), sum(y[4] for y in ys) / n]
+
+
 def run_summary(rr: List[dict], cfg) -> dict:
     """Per-run aggregates. Ordinary-room metrics use ONLY room_kind == 'enemy'
     (boss rooms are reported separately: shared deterministic boss policy)."""
@@ -82,6 +99,11 @@ def run_summary(rr: List[dict], cfg) -> dict:
     ev = [e for e in loot_dataset.derive_from_rows(rr, cfg)
           if e["selected_category"] != "none" and e["horizon_combat_rooms"] >= 1]
     s["n_loot"] = len(ev)
+    if combat:
+        s["run_vector"] = run_level_vector(combat, cfg)
+        s["run_balance"] = balance.balance_distance(s["run_vector"], cfg)
+    else:
+        s["run_vector"], s["run_balance"] = None, None
     for c in LOOT_H + ["horizon_balance_distance", "terminated_early"]:
         s["loot_sum_" + c] = sum(float(e[c]) for e in ev)
     for i, col in enumerate(balance.OUTCOME_COLUMNS):
@@ -132,6 +154,43 @@ def bootstrap_ci(S: List[dict], fn, b: int, seed: int):
     rng = random.Random(seed)
     vals = sorted(fn([S[rng.randrange(len(S))] for _ in range(len(S))]) for _ in range(b))
     return est, vals[int(0.025 * (b - 1))], vals[int(0.975 * (b - 1))]
+
+
+def _quant(v: List[float], q: float) -> float:
+    v = sorted(v)
+    pos = q * (len(v) - 1)
+    lo, hi = int(math.floor(pos)), int(math.ceil(pos))
+    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+
+
+def primary_stats(S: List[dict], b: int, seed: int) -> dict:
+    """Distribution of the run-level balance B_r (runs are the units)."""
+    valid = [s for s in S if s["run_balance"] is not None]
+    B = [s["run_balance"] for s in valid]
+    if not B:
+        return {"n_runs_with_ordinary_rooms": 0, "n_runs_excluded": len(S)}
+    mean = sum(B) / len(B)
+    sd = math.sqrt(sum((x - mean) ** 2 for x in B) / max(len(B) - 1, 1))
+    est, lo, hi = bootstrap_ci(valid, lambda T: sum(t["run_balance"] for t in T) / len(T), b, seed)
+    _, mlo, mhi = bootstrap_ci(valid, lambda T: _quant([t["run_balance"] for t in T], 0.5), b, seed)
+    agg = {c: sum(s["run_vector"][j] for s in valid) / len(valid) for j, c in enumerate(RUN_LEVEL_COLUMNS)}
+    return {"n_runs_with_ordinary_rooms": len(B), "n_runs_excluded": len(S) - len(B),
+            "mean": mean, "mean_ci": [lo, hi], "median": _quant(B, 0.5), "median_ci": [mlo, mhi],
+            "sd": sd, "q25": _quant(B, 0.25), "q75": _quant(B, 0.75), "iqr": _quant(B, 0.75) - _quant(B, 0.25),
+            "mean_run_level_outcomes": agg}
+
+
+def primary_paired(S: List[dict], base: List[dict], b: int, seed: int) -> dict:
+    bb = {s["run_seed"]: s for s in base if s["run_balance"] is not None}
+    pairs = [(s, bb[s["run_seed"]]) for s in S if s["run_balance"] is not None and s["run_seed"] in bb]
+    if len(pairs) < 2:
+        return {"n_pairs": len(pairs)}
+    diffs = [p[0]["run_balance"] - p[1]["run_balance"] for p in pairs]
+    est, lo, hi = bootstrap_ci(pairs, lambda P: sum(p[0]["run_balance"] - p[1]["run_balance"] for p in P) / len(P),
+                               b, seed)
+    return {"n_pairs": len(pairs), "mean_diff": est, "ci_low": lo, "ci_high": hi,
+            "median_diff": _quant(diffs, 0.5), "share_lower_balance_loss": sum(d < 0 for d in diffs) / len(diffs),
+            "share_ties": sum(d == 0 for d in diffs) / len(diffs)}
 
 
 def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, seed: int = 0,
@@ -206,6 +265,7 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
             for col in ("applied_raw_hp_mult", "applied_raw_dmg_mult", "applied_raw_speed_mult",
                         "applied_raw_spawn_count"):
                 entry["mean_action"][col] = sum(float(r[col]) for r in nb) / len(nb)
+        entry["primary"] = primary_stats(S, b, seed)
         summary["controllers"][c] = entry
 
         depth: Dict[int, List[int]] = {}
@@ -218,6 +278,17 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
                                         for d, v in sorted(depth.items())}
 
     baselines = ("heuristic", "fixed") if group_by == "enemy_controller" else ("heuristic", "fixed_uniform")
+    summary["primary_metric"] = cfg.get("primary_metric", {})
+    summary["primary_ranking"] = sorted(
+        [c for c in ctrls if summary["controllers"][c]["primary"].get("n_runs_with_ordinary_rooms")],
+        key=lambda c: summary["controllers"][c]["primary"]["mean"])
+    summary["primary_paired"] = {}
+    for base_name in baselines:
+        if base_name in run_sums:
+            for c in ctrls:
+                if c != base_name:
+                    summary["primary_paired"].setdefault(f"vs_{base_name}", {})[c] = primary_paired(
+                        run_sums[c], run_sums[base_name], b, seed)
     for base_name in baselines:
         if base_name not in run_sums:
             continue
@@ -270,6 +341,15 @@ def _write_tables(summary, ctrls, out_dir):
         for c in ctrls:
             for d, v in summary["death_by_depth"][c].items():
                 w.writerow([c, d, v["rooms"], v["deaths"], v["rate"]])
+    with open(os.path.join(out_dir, "primary_run_balance.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["condition", "n_runs", "n_excluded", "mean", "mean_ci_low", "mean_ci_high", "median",
+                    "sd", "q25", "q75", "iqr"])
+        for c in ctrls:
+            p_ = summary["controllers"][c]["primary"]
+            if p_.get("n_runs_with_ordinary_rooms"):
+                w.writerow([c, p_["n_runs_with_ordinary_rooms"], p_["n_runs_excluded"], p_["mean"], *p_["mean_ci"],
+                            p_["median"], p_["sd"], p_["q25"], p_["q75"], p_["iqr"]])
     with open(os.path.join(out_dir, "paired_differences.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["comparison", "controller", "metric", "diff", "ci_low", "ci_high", "n_pairs"])
@@ -283,7 +363,33 @@ def _write_tables(summary, ctrls, out_dir):
          f"Experiment config `{summary['experiment_config_version']}` "
          f"(`{summary['experiment_config_hash']}`), source: {summary['source']}. "
          f"95% CIs: run-level bootstrap, B={summary['bootstrap']['B']}.", "",
-         "## Counts, validity and fallbacks", "",
+         "## PRIMARY: run-level ordinary-combat balance B_r (lower is better; run = unit)", "",
+         "B_r applies the frozen target loss to each run's aggregated ordinary-combat outcomes "
+         "(death rate, mean post-room HP, summed damage share, summed efficiency, mean duration).", "",
+         "| condition | runs (excluded) | mean B_r [95% CI] | median [95% CI] | sd | IQR (q25-q75) | "
+         "death rate | post HP | damage share | efficiency | duration |",
+         "|---" * 11 + "|"]
+    for c in ctrls:
+        p_ = summary["controllers"][c]["primary"]
+        if not p_.get("n_runs_with_ordinary_rooms"):
+            L.append(f"| {c} | 0 ({p_.get('n_runs_excluded', 0)}) | - | - | - | - | - | - | - | - | - |")
+            continue
+        a = p_["mean_run_level_outcomes"]
+        L.append(f"| {c} | {p_['n_runs_with_ordinary_rooms']} ({p_['n_runs_excluded']}) | {p_['mean']:.4f} "
+                 f"[{p_['mean_ci'][0]:.4f}, {p_['mean_ci'][1]:.4f}] | {p_['median']:.4f} "
+                 f"[{p_['median_ci'][0]:.4f}, {p_['median_ci'][1]:.4f}] | {p_['sd']:.4f} | {p_['iqr']:.4f} "
+                 f"({p_['q25']:.4f}-{p_['q75']:.4f}) | " + " | ".join(f"{a[k]:.3f}" for k in RUN_LEVEL_COLUMNS) + " |")
+    L += ["", "Primary ranking (mean B_r): " + " < ".join(summary.get("primary_ranking", [])), ""]
+    for comp, per in summary.get("primary_paired", {}).items():
+        L += [f"Matched-seed paired B_r differences {comp.replace('_', ' ')} (condition minus baseline):", "",
+              "| condition | pairs | mean diff [95% CI] | median diff | share of seeds with lower B_r | ties |",
+              "|---|---|---|---|---|---|"]
+        for c, d in per.items():
+            if "mean_diff" in d:
+                L.append(f"| {c} | {d['n_pairs']} | {d['mean_diff']:+.4f} [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}] | "
+                         f"{d['median_diff']:+.4f} | {d['share_lower_balance_loss']:.2f} | {d['share_ties']:.2f} |")
+        L.append("")
+    L += ["## Counts, validity and fallbacks", "",
          "| controller | runs | rows | combat rooms | fallback rows | actions at bound | action sources |",
          "|---|---|---|---|---|---|---|"]
     for c in ctrls:
@@ -304,7 +410,8 @@ def _write_tables(summary, ctrls, out_dir):
         m = summary["controllers"][c]["metrics"]
         L.append(f"| {c} | " + " | ".join(_fmt(m[k]) for k in BOSS_METRICS)
                  + f" | {summary['controllers'][c]['boss_rows_shared_policy']} |")
-    L += ["", "## Per-room observed outcomes (ordinary combat rooms only; boss rooms excluded)", "",
+    L += ["", "## DIAGNOSTIC: per-room observed outcomes and raw per-room balance (ordinary combat rooms; "
+          "not used for ranking)", "",
           "| controller | " + " | ".join(balance.OUTCOME_COLUMNS) + " | balance distance |",
           "|---" * (len(balance.OUTCOME_COLUMNS) + 2) + "|"]
     for c in ctrls:
@@ -331,6 +438,16 @@ def _write_tables(summary, ctrls, out_dir):
                                                                   "h_damage_share", "horizon_balance_distance",
                                                                   "terminated_early")) + " |")
     pvo = summary.get("predicted_vs_observed")
+    if pvo and pvo.get("run_level"):
+        L += ["", "## PRIMARY predicted vs. observed: run-level (Q room predictions aggregated per run)", "",
+              "| condition | runs | quantity | predicted mean | observed mean | bias | MAE | r |", "|---|---|---|---|---|---|---|---|"]
+        for c, rl in pvo["run_level"].items():
+            for q, v in rl.items():
+                if q == "n_runs":
+                    continue
+                key_p = "predicted_mean"
+                L.append(f"| {c} | {rl['n_runs']} | {q} | {v[key_p]:.4f} | {v['observed_mean']:.4f} | "
+                         f"{v['bias']:+.4f} | {v['mae']:.4f} | " + (f"{v['pearson_r']:.3f}" if "pearson_r" in v else "") + " |")
     if pvo:
         L += ["", f"## Predicted vs. observed ({pvo.get('model', '')})", "",
               "| condition | quantity | predicted | observed |", "|---|---|---|---|"]

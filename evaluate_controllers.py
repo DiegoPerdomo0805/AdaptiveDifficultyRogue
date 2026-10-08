@@ -128,13 +128,39 @@ def enemy_predicted_vs_observed(q_source: str, per_condition_rows: dict) -> dict
         d["mean_balance_distance"] = {
             "predicted": sum(balance.expected_balance_distance(p, cfg) for p in pred) / len(pred),
             "observed": sum(balance.balance_distance(o, cfg) for o in obs) / len(obs)}
-        mp = [sum(p[j] for p in pred) / len(pred) for j in range(len(pred[0]))]
-        mo = [sum(o[j] for o in obs) / len(obs) for j in range(len(obs[0]))]
-        d["rate_level_balance_distance"] = {"predicted": balance.balance_distance(mp, cfg),
-                                            "observed": balance.balance_distance(mo, cfg)}
+        # PRIMARY: run-level aggregation, identical definitions for predicted
+        # and observed (analyze_results.run_level_vector); Q predicts per-room
+        # ratios, so the predicted damage share / efficiency of a run is the
+        # mean of its rooms' predictions (Q does not predict raw damage).
+        by_run = {}
+        for r, p in zip(rs, pred):
+            by_run.setdefault(r["run_id"], ([], []))
+            by_run[r["run_id"]][0].append(r)
+            by_run[r["run_id"]][1].append(p)
+        pv, ov = [], []
+        for rows_r, preds_r in by_run.values():
+            pv.append([sum(p[j] for p in preds_r) / len(preds_r) for j in range(5)])
+            ov.append(analyze_results.run_level_vector(rows_r, cfg))
+        pb = [balance.balance_distance(v, cfg) for v in pv]
+        ob = [balance.balance_distance(v, cfg) for v in ov]
+        n = len(pb)
+        mpb, mob = sum(pb) / n, sum(ob) / n
+        cov = sum((a - mpb) * (b - mob) for a, b in zip(pb, ob))
+        den = (sum((a - mpb) ** 2 for a in pb) * sum((b - mob) ** 2 for b in ob)) ** 0.5
+        run_level = {"n_runs": n,
+                     "B_r": {"predicted_mean": mpb, "observed_mean": mob,
+                             "mae": sum(abs(a - b) for a, b in zip(pb, ob)) / n,
+                             "bias": mpb - mob, "pearson_r": cov / den if den > 0 else float("nan")}}
+        for j, c in enumerate(analyze_results.RUN_LEVEL_COLUMNS):
+            run_level[c] = {"predicted_mean": sum(v[j] for v in pv) / n, "observed_mean": sum(v[j] for v in ov) / n,
+                            "mae": sum(abs(a[j] - b[j]) for a, b in zip(pv, ov)) / n,
+                            "bias": sum(a[j] - b[j] for a, b in zip(pv, ov)) / n}
+        d["run_level_B_r_mean"] = {"predicted": mpb, "observed": mob}
+        out.setdefault("run_level", {})[cond] = run_level
         out["by_condition"][cond] = d
-    out["note"] = ("predicted balance distance = expected loss with death ~ Bernoulli(P(death)) "
-                   "(balance.expected_balance_distance), comparable to the observed mean over 0/1 deaths")
+    out["note"] = ("PRIMARY = run_level (Q room predictions aggregated per run like the observed run-level "
+                   "metric; calibration = bias/MAE/Pearson r across runs). Room-level rows are diagnostic: "
+                   "mean_balance_distance predicted = expected loss with death ~ Bernoulli(P(death)).")
     return out
 
 

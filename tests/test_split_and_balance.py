@@ -125,3 +125,51 @@ def test_principal_collection_mixture_excludes_learned_loot():
     rmix = bot_runner.parse_mix_spec(pc["reward_policy_mix"], ("fixed_uniform", "heuristic", "exploration",
                                                                "learned_loot"))
     assert set(rmix) == {"fixed_uniform", "heuristic", "exploration"} and pc["learned_loot_allowed"] is False
+
+
+def test_pseudo_huber_capped_scale_shape():
+    s_lo, s_hi = balance.side_scales(family="enemy")
+    cfg = balance.load_experiment_config()
+    t = cfg["enemy_balance_targets"]
+    # capped side scales: death cannot go below 0; duration below 0.10 gets s = 0.10
+    assert s_lo[0] == 0.0 and s_hi[0] == pytest.approx(0.10)
+    assert s_lo[4] == pytest.approx(0.10) and s_hi[1] == pytest.approx(0.15)
+    mid = [(t[c]["low"] + t[c]["high"]) / 2 for c in balance.OUTCOME_COLUMNS]
+    # quadratic near the bound, ~linear far away: increments become constant
+    def L(v):
+        y = list(mid)
+        y[0] = v
+        return balance.balance_distance(y)
+    inc = [L(0.08 + 0.1 * (k + 1)) - L(0.08 + 0.1 * k) for k in range(9)]
+    assert all(b > a for a, b in zip(inc, inc[1:]))           # convex, increasing
+    assert inc[-1] / inc[-2] < 1.02                          # asymptotically linear
+    assert L(1.0) < 8.0                                      # no quadratic blow-up (was 36.3)
+
+
+def test_run_level_vector_uses_summed_damage_and_efficiency():
+    import analyze_results
+    rows = [_row(died_in_room=0, post_hp_ratio=0.8, damage_taken_in_room=10, damage_dealt_in_room=90,
+                 melee_kills_in_room=2, magic_kills_in_room=0, melee_hits_in_room=4, magic_hits_in_room=0,
+                 time_in_room=6),
+            _row(died_in_room=1, post_hp_ratio=0.0, damage_taken_in_room=50, damage_dealt_in_room=10,
+                 melee_kills_in_room=0, magic_kills_in_room=0, melee_hits_in_room=6, magic_hits_in_room=0,
+                 time_in_room=12)]
+    v = analyze_results.run_level_vector(rows, balance.load_experiment_config())
+    assert v[0] == pytest.approx(0.5)                         # death rate
+    assert v[1] == pytest.approx(0.4)                         # mean post HP (fatal room = 0)
+    assert v[2] == pytest.approx(60 / 160)                    # summed share, NOT mean of ratios
+    assert v[3] == pytest.approx(2 / 10)                      # summed kills / summed hits
+    assert v[4] == pytest.approx((6 / 30 + 12 / 30) / 2)
+
+
+def test_primary_stats_and_paired_differences():
+    import analyze_results
+    S = [{"run_seed": str(i), "run_balance": float(i), "run_vector": [0.0] * 5} for i in range(10)]
+    S.append({"run_seed": "x", "run_balance": None, "run_vector": None})
+    p = analyze_results.primary_stats(S, 200, 0)
+    assert p["n_runs_with_ordinary_rooms"] == 10 and p["n_runs_excluded"] == 1
+    assert p["mean"] == pytest.approx(4.5) and p["median"] == pytest.approx(4.5)
+    assert p["iqr"] == pytest.approx(p["q75"] - p["q25"]) and p["mean_ci"][0] <= 4.5 <= p["mean_ci"][1]
+    base = [dict(s, run_balance=(s["run_balance"] + 1.0) if s["run_balance"] is not None else None) for s in S]
+    d = analyze_results.primary_paired(S, base, 200, 0)
+    assert d["n_pairs"] == 10 and d["mean_diff"] == pytest.approx(-1.0) and d["share_lower_balance_loss"] == 1.0

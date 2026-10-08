@@ -45,6 +45,16 @@
                       "description": "With the archetype's p_take_loot the bot picks one of the 3 offers uniformly at random, otherwise it takes nothing."}
   },
 
+  "balance_loss": {
+    "shape": "pseudo_huber_capped_scale",
+    "description": "term_i = w_i * 2*(sqrt(1+(d/s)^2)-1) with d the distance outside the interval and s the configured scale capped, per side, at the distance between that interval bound and the physical limit; L = sum(term_i)/sum(w_i). Chosen to remove asymmetric scale artefacts and unbounded quadratic dominance (pre-freeze audit), not to favour any controller."
+  },
+
+  "primary_metric": {
+    "name": "run_level_ordinary_balance",
+    "description": "Per run, over ordinary combat rooms only (no boss, no non-combat rooms): death rate = deaths / rooms; post_hp = mean post-room HP ratio (0 for a fatal room); damage_share = sum(taken) / (sum(taken) + sum(dealt)); combat_efficiency = sum(kills) / max(sum(hits), 1); duration_norm = mean per-room min(t/30 s, 1). B_r = balance loss of that vector. Controllers are ranked by mean B_r across runs (run = experimental unit), with bootstrap CIs and matched-seed paired differences. Runs without ordinary combat rooms are excluded and counted."
+  },
+
   "outcomes": {
     "columns": ["death", "post_hp_ratio", "damage_share", "combat_efficiency", "duration_norm"],
     "duration_norm_seconds": 30.0,

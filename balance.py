@@ -29,9 +29,18 @@ Enemy outcome vector (order is part of the checkpoint contract):
 Loot-horizon outcome vector: death_within, end_hp_ratio, damage_share,
 combat_efficiency, duration_norm_per_room (see loot_dataset.py).
 
-Balance loss: d_i = max(low_i - y_i, 0) + max(y_i - high_i, 0) and
-  L = sum_i w_i * (d_i / s_i)^2 / sum_i w_i
-which is exactly 0 inside every interval and grows smoothly outside.
+Balance loss (experiment_config.balance_loss.shape = "pseudo_huber_capped_scale"):
+  below the interval: d = low_i - y,  s = min(scale_i, low_i - physical_low_i)
+  above the interval: d = y - high_i, s = min(scale_i, physical_high_i - high_i)
+  term_i = w_i * 2 * (sqrt(1 + (d / s)^2) - 1)          (0 inside the interval)
+  L = sum_i term_i / sum_i w_i
+Pseudo-Huber is quadratic near the interval and grows linearly far away, so
+a component that can sit many scales outside (e.g. death up to 1.0) does not
+dominate through quadratic growth; capping each side's scale at the distance
+to the physical limit lets a side whose bound is close to the limit (e.g.
+duration below 0.10) still reach a full scale of deviation. A side whose
+bound IS the physical limit (death below 0) cannot be violated. The loss is
+exactly 0 inside, C1 at the bounds and strictly increasing outside.
 
 Stdlib-only at import time (torch is imported lazily).
 """
@@ -97,6 +106,8 @@ def _validate_config(cfg: dict):
         raise ExperimentConfigError(f"outcomes.columns must be {OUTCOME_COLUMNS}")
     if cfg["loot_horizon"].get("columns") != LOOT_OUTCOME_COLUMNS:
         raise ExperimentConfigError(f"loot_horizon.columns must be {LOOT_OUTCOME_COLUMNS}")
+    if cfg.get("balance_loss", {}).get("shape") != "pseudo_huber_capped_scale":
+        raise ExperimentConfigError("balance_loss.shape must be 'pseudo_huber_capped_scale'")
     if float(cfg["outcomes"].get("duration_norm_cap", 0)) != 1.0:
         raise ExperimentConfigError("duration_norm is a bounded normalized outcome: duration_norm_cap must be 1.0")
     if int(cfg["loot_horizon"].get("combat_rooms", 0)) != 3:
@@ -170,12 +181,32 @@ def outcome_vector(row, cfg: Optional[dict] = None) -> List[float]:
 # Balance loss
 # ---------------------------------------------------------------------------
 
+def side_scales(cfg: Optional[dict] = None, family: str = "enemy"):
+    """(s_below, s_above) per component: the configured scale capped at the
+    distance from the interval bound to the physical limit (0 = side cannot
+    be violated)."""
+    low, high, scale, _ = target_arrays(cfg, family)
+    rng = output_ranges(family, cfg)
+    s_lo = [min(scale[i], low[i] - rng[i][0]) for i in range(len(low))]
+    s_hi = [min(scale[i], rng[i][1] - high[i]) for i in range(len(low))]
+    return s_lo, s_hi
+
+
+def _phuber(u: float) -> float:
+    return 2.0 * (math.sqrt(1.0 + u * u) - 1.0)
+
+
 def balance_terms(y: Sequence[float], cfg: Optional[dict] = None, family: str = "enemy") -> List[float]:
-    low, high, scale, weight = target_arrays(cfg, family)
+    low, high, _, weight = target_arrays(cfg, family)
+    s_lo, s_hi = side_scales(cfg, family)
     out = []
     for i in range(len(low)):
-        d = max(low[i] - y[i], 0.0) + max(y[i] - high[i], 0.0)
-        out.append(weight[i] * (d / scale[i]) ** 2)
+        if y[i] < low[i] and s_lo[i] > 0:
+            out.append(weight[i] * _phuber((low[i] - y[i]) / s_lo[i]))
+        elif y[i] > high[i] and s_hi[i] > 0:
+            out.append(weight[i] * _phuber((y[i] - high[i]) / s_hi[i]))
+        else:
+            out.append(0.0)
     return out
 
 
@@ -205,10 +236,13 @@ def balance_loss_torch(y, cfg: Optional[dict] = None, reduce: bool = True, famil
     """Differentiable balance loss over (N, D) outcome tensors whose binary
     column is already a probability."""
     import torch
-    low, high, scale, weight = (torch.tensor(a, dtype=y.dtype, device=y.device)
-                                for a in target_arrays(cfg, family))
-    d = torch.relu(low - y) + torch.relu(y - high)
-    per_row = ((d / scale) ** 2 * weight).sum(dim=1) / weight.sum().clamp_min(1e-12)
+    low, high, _, weight = (torch.tensor(a, dtype=y.dtype, device=y.device)
+                            for a in target_arrays(cfg, family))
+    s_lo, s_hi = (torch.tensor(a, dtype=y.dtype, device=y.device) for a in side_scales(cfg, family))
+    u_lo = torch.where(s_lo > 0, torch.relu(low - y) / s_lo.clamp_min(1e-12), torch.zeros_like(y))
+    u_hi = torch.where(s_hi > 0, torch.relu(y - high) / s_hi.clamp_min(1e-12), torch.zeros_like(y))
+    u = u_lo + u_hi                       # at most one side is non-zero
+    per_row = (2.0 * (torch.sqrt(1.0 + u * u) - 1.0) * weight).sum(dim=1) / weight.sum().clamp_min(1e-12)
     return per_row.mean() if reduce else per_row
 
 
@@ -320,8 +354,8 @@ def target_audit(cfg: Optional[dict] = None, family: str = "enemy",
                          loss > 0 and strictly increasing as the value moves
                          away from the interval (sampled to the physical bound)
       c1_at_bounds       one-sided derivative at each bound is 0 (smooth join)
-      one_scale_loss     loss exactly one `scale` outside = w_i / sum(w)
-                         (normalization identity)
+      one_scale_loss_*   loss exactly one SIDE scale outside = 2(sqrt2-1) w_i / sum(w)
+                         (normalization identity); can_contribute: some side can be violated
       max_loss_below/above  loss at the physical bound (exposes range effects)
 
     Empirical (optional `vectors`: {label: [outcome vectors]}, binary column as
@@ -336,6 +370,7 @@ def target_audit(cfg: Optional[dict] = None, family: str = "enemy",
     ranges = output_ranges(family, cfg)
     wsum = sum(weight)
     mid = [(lo + hi) / 2 for lo, hi in zip(low, high)]
+    s_lo, s_hi = side_scales(cfg, family)
 
     def loss_with(i, v):
         y = list(mid)
@@ -361,9 +396,13 @@ def target_audit(cfg: Optional[dict] = None, family: str = "enemy",
             "increasing_above": all(b > a for a, b in zip(la, la[1:])) if la else None,
             "c1_at_bounds": abs(loss_with(i, lo - eps) - loss_with(i, lo)) / eps < 1e-4
                             and abs(loss_with(i, hi + eps) - loss_with(i, hi)) / eps < 1e-4,
-            "one_scale_loss": loss_with(i, hi + s) if hi + s <= phi + 1e-9 else loss_with(i, lo - s),
-            "one_scale_identity_ok": abs((loss_with(i, hi + s) if hi + s <= phi + 1e-9 else loss_with(i, lo - s))
-                                         - weight[i] / wsum) < 1e-9,
+            "side_scale_below": s_lo[i], "side_scale_above": s_hi[i],
+            "one_scale_loss_below": loss_with(i, lo - s_lo[i]) if s_lo[i] > 0 else None,
+            "one_scale_loss_above": loss_with(i, hi + s_hi[i]) if s_hi[i] > 0 else None,
+            "one_scale_identity_ok": all(abs(loss_with(i, v) - _phuber(1.0) * weight[i] / wsum) < 1e-9
+                                         for v in ([lo - s_lo[i]] if s_lo[i] > 0 else [])
+                                         + ([hi + s_hi[i]] if s_hi[i] > 0 else [])),
+            "can_contribute": (lo > plo and loss_with(i, plo) > 0) or (hi < phi and loss_with(i, phi) > 0),
             "max_loss_below": loss_with(i, plo) if lo > plo else 0.0,
             "max_loss_above": loss_with(i, phi) if hi < phi else 0.0,
             "lower_bound_active": lo > plo,
@@ -383,7 +422,12 @@ def target_audit(cfg: Optional[dict] = None, family: str = "enemy",
             e["components"][col] = {"share": share, "outside_fraction": outside,
                                     "dominant": share > 0.80, "inactive": share < 0.02 and outside < 0.02}
         out["empirical"][label] = e
+    # Audit criterion (approved): every component must be analytically able
+    # to contribute, correctly scaled (side-scale identity) and monotonically
+    # penalized outside its interval. Empirical shares are REPORTED, not gated:
+    # components whose violations are rare act as guard rails.
     out["analytic_ok"] = all(c["zero_inside"] and c["c1_at_bounds"] and c["one_scale_identity_ok"]
+                             and c["can_contribute"]
                              and c["positive_below"] is not False and c["increasing_below"] is not False
                              and c["positive_above"] is not False and c["increasing_above"] is not False
                              for c in comps.values())
@@ -489,12 +533,13 @@ def _run_audit(args, cfg) -> int:
         a = rep[fam]
         print(f"== {fam} ({a['targets_section']}), weight sum {a['weight_sum']}, analytic checks "
               f"{'PASS' if a['analytic_ok'] else 'FAIL'}")
-        print(f"   {'component':22s} {'interval':14s} {'scale':>6s} {'w/sum':>6s} {'1-scale':>8s} "
-              f"{'maxL<':>7s} {'maxL>':>7s} zero_in C1 incr<  incr>")
+        print(f"   {'component':22s} {'interval':12s} {'s_below':>7s} {'s_above':>7s} {'w/sum':>6s} "
+              f"{'maxL<':>7s} {'maxL>':>7s} zero_in C1    identity contrib incr<  incr>")
         for col, c in a["components"].items():
-            print(f"   {col:22s} [{c['interval'][0]:.2f},{c['interval'][1]:.2f}]    {c['scale']:6.3f} "
-                  f"{c['normalized_weight']:6.3f} {c['one_scale_loss']:8.4f} {c['max_loss_below']:7.3f} "
+            print(f"   {col:22s} [{c['interval'][0]:.2f},{c['interval'][1]:.2f}]  {c['side_scale_below']:7.3f} "
+                  f"{c['side_scale_above']:7.3f} {c['normalized_weight']:6.3f} {c['max_loss_below']:7.3f} "
                   f"{c['max_loss_above']:7.3f} {str(c['zero_inside']):7s} {str(c['c1_at_bounds']):5s} "
+                  f"{str(c['one_scale_identity_ok']):8s} {str(c['can_contribute']):7s} "
                   f"{str(c['increasing_below']):6s} {str(c['increasing_above'])}")
         for label, e in a["empirical"].items():
             cells = "  ".join(f"{col}:{v['share']:.2f}/{v['outside_fraction']:.2f}"

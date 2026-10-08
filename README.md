@@ -103,15 +103,47 @@ Non-combat rooms never count. The horizon stops early at death, at victory, or w
 | `duration_norm_per_room` | mean per-room duration |
 
 The derived CSV also records progress gained, boss reached, incomplete horizon and termination reason.
-Balance loss = `Σ wᵢ(dᵢ/sᵢ)² / Σ wᵢ`, which is zero inside each target interval. Targets live in
-`experiment_config.json` (`enemy_balance_targets`, `loot_horizon_balance_targets`).
+**Balance loss: pseudo-Huber with capped side scales.** For each component:
+
+```text
+term_i = w_i · 2(√(1 + (d/s)²) − 1),   L = Σ term_i / Σ w_i
+```
+
+- `d` is the distance outside the interval (0 inside).
+- `s` is the configured scale, capped on each side at the distance from that interval bound to the
+  physical limit. A bound that *is* the limit (death below 0) cannot be violated.
+- The loss is exactly 0 inside each interval, smooth (C1) at the bounds, quadratic near the interval
+  and linear far away. Quadratic growth can therefore no longer make one component dominate.
+
+Targets live in `experiment_config.json` (`enemy_balance_targets`, `loot_horizon_balance_targets`,
+`balance_loss`).
+
+**Primary controller metric: run-level ordinary-combat balance B_r.** Each run is one experimental
+unit. Its ordinary combat rooms (no boss, no non-combat rooms) are aggregated into:
+- death rate;
+- mean post-room HP (0 for a fatal room);
+- summed damage share, Σtaken / (Σtaken + Σdealt);
+- summed efficiency, Σkills / max(Σhits, 1);
+- mean `duration_norm`.
+
+B_r is the balance loss of that vector. Controllers are ranked by mean B_r, reported with
+median / sd / IQR, bootstrap CIs and matched-seed paired differences. Raw per-room balance is
+**diagnostic only**. Q stays room-conditioned; for evaluation its room predictions are aggregated
+per run in the same way (run-level calibration: bias / MAE / r).
 Every Q_enemy / Q_loot output is contractually bounded to [0, 1] (probabilities, shares, ratios and
 normalized durations), and the networks enforce that bound by construction.
 
 The ordinary-room targets are **design-intent** values: death [0, 0.08], post_hp [0.35, 0.85],
 damage_share [0.09, 0.31], combat_efficiency [0.15, 0.50], duration_norm [0.10, 0.50]. They are
-**not** pilot quantiles. `balance.py audit` checks them component by component: zero loss inside,
-smooth increasing loss outside, the normalization identity, and empirical contribution shares.
+**not** pilot quantiles. `balance.py audit` checks each component analytically:
+- zero loss inside;
+- able to contribute (some side can be violated);
+- correctly scaled (the side-scale identity);
+- C1 at the bounds;
+- strictly increasing outside.
+
+It also reports empirical contribution shares, but does not gate on them: components whose violations
+are rare (efficiency, duration) act as guard rails.
 Boss outcomes are not part of the ordinary-room utility.
 
 ## Equipment audit (human game vs. bot)
