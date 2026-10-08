@@ -1,6 +1,6 @@
 {
-  "experiment_config_version": "exp_v3.2-pilot",
-  "status": "PILOT: supersedes the exp_v3.1 freeze (kept as history) because cGAN checkpoint selection was misaligned with the run-level primary metric. Adds closed-loop validation-rollout selection and explicit train/validation/test seed partitions. Targets, weights and loss shape are unchanged. Freeze as exp_v3.2 after all checks pass; exp_v3.1 datasets are never reused.",
+  "experiment_config_version": "exp_v3.2",
+  "status": "FROZEN: supersedes exp_v3.1 (kept in freeze_history/ and git). Design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric B_r, closed-loop checkpoint selection (mean(B_r) + 0.5*CVaR_0.90(B_r) on selection_validation rollouts; death <= 0.08, OOD excess <= 0.05, runtime guard <= 0.01, fallbacks <= 0.01), fixed_default, shared boss, collection mixtures, gates, split seeds, non-overlapping seed partitions, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). exp_v3.1 datasets are never reused. Do not modify after collection starts.",
 
   "enemy_controller": {
     "fixed": {
