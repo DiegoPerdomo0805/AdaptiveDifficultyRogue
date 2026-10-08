@@ -1,15 +1,13 @@
 {
-  "experiment_config_version": "exp_v1.1-pilot",
-  "status": "PILOT_PLACEHOLDER: balance targets are provisional and MUST be calibrated from the Stage A pilot (python balance.py calibrate ...), then frozen by changing status to FROZEN and bumping experiment_config_version before the principal collection.",
+  "experiment_config_version": "exp_v2.0-pilot",
+  "status": "PILOT: all balance targets are provisional. Run the Stage A calibration (python balance.py calibrate ...), review the proposed intervals, then set status to FROZEN and bump experiment_config_version before the principal collection.",
 
-  "controllers": {
+  "enemy_controller": {
     "fixed": {
       "version": "fixed_v1",
       "action": {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3}
     },
-    "heuristic": {
-      "version": "heuristic_rule_based_dda_v1.2"
-    },
+    "heuristic": {"version": "heuristic_rule_based_dda_v1.2"},
     "exploration": {
       "version": "exploration_v1",
       "mixture": {"perturb": 0.70, "uniform": 0.20, "reference": 0.10},
@@ -22,10 +20,27 @@
         {"enemy_hp_mult": 2.2, "enemy_dmg_mult": 1.8, "enemy_speed_mult": 1.4, "spawn_count": 5}
       ]
     },
-    "cgan": {
-      "version": "cgan_outcome_guided_v1",
-      "max_invalid_outputs": 3
-    }
+    "cgan": {"version": "cgan_outcome_guided_v2", "max_invalid_outputs": 3},
+    "non_combat_action": {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 2}
+  },
+
+  "shared_boss": {
+    "version": "shared_boss_v1",
+    "description": "Deterministic boss policy shared by every experimental condition. The raw action below passes through dda_core.effective_applied_config (hp x4, dmg x1.7, speed x0.9, one boss). No enemy model is invoked in boss rooms.",
+    "raw_action": {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3}
+  },
+
+  "reward_policy": {
+    "fixed_uniform": {"version": "fixed_uniform_v1"},
+    "heuristic": {"version": "heuristic_loot_bias_v1"},
+    "exploration": {
+      "version": "loot_exploration_v1",
+      "mixture": {"focus": 0.60, "uniform": 0.20, "heuristic": 0.20},
+      "focus_mass": 0.70
+    },
+    "learned_loot": {"version": "learned_loot_v1", "max_invalid_outputs": 3, "fallback": "heuristic"},
+    "bot_selection": {"mechanism": "bot_uniform_offer_pick_v1",
+                      "description": "With the archetype's p_take_loot the bot picks one of the 3 offers uniformly at random, otherwise it takes nothing."}
   },
 
   "outcomes": {
@@ -34,12 +49,42 @@
     "duration_norm_cap": 2.0
   },
 
-  "balance_targets": {
+  "enemy_balance_targets": {
     "death":             {"low": 0.0,  "high": 0.08, "scale": 0.10, "weight": 3.0},
     "post_hp_ratio":     {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
     "damage_share":      {"low": 0.09, "high": 0.31, "scale": 0.12, "weight": 1.0},
     "combat_efficiency": {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
     "duration_norm":     {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
+  },
+
+  "loot_horizon": {
+    "combat_rooms": 3,
+    "columns": ["death_within", "end_hp_ratio", "damage_share", "combat_efficiency", "duration_norm_per_room"]
+  },
+
+  "loot_horizon_balance_targets": {
+    "death_within":           {"low": 0.0,  "high": 0.15, "scale": 0.15, "weight": 3.0},
+    "end_hp_ratio":           {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
+    "damage_share":           {"low": 0.09, "high": 0.31, "scale": 0.12, "weight": 1.0},
+    "combat_efficiency":      {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
+    "duration_norm_per_room": {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
+  },
+
+  "enemy_action_support": {
+    "box_quantiles": [0.01, 0.99],
+    "knn_k": 10,
+    "knn_threshold_quantile": 0.95,
+    "lambda_support": 5.0,
+    "runtime_ood_factor": 1.5,
+    "reference_max_rows": 4000
+  },
+
+  "loot_action_support": {
+    "min_category_prob": 0.05,
+    "min_category_events": 30,
+    "lambda_entropy": 0.05,
+    "lambda_diversity": 0.5,
+    "diversity_tau": 0.02
   },
 
   "q_gate": {
@@ -49,14 +94,35 @@
     "min_action_gain_rel": 0.02
   },
 
+  "q_loot_gate": {
+    "min_reward_gain_rel": 0.01,
+    "require_beats_naive": true,
+    "description": "Learned loot is trained only if the best reward-aware Q_loot beats the state-only Q_loot(x) on held-out runs by min_reward_gain_rel in aggregate skill, and beats the naive predictor."
+  },
+
+  "cgan_training": {
+    "lambda_balance": 10.0,
+    "lambda_diversity": 1.0,
+    "description": "Defaults for train_cgan.py (CLI flags override and are recorded). lambda_balance=1 let the adversarial term pull G back toward the observed action distribution during the smoke pilot."
+  },
+
   "cgan_selection": {
+    "min_epoch": 10,
+    "min_diversity": 0.01,
+    "min_sensitivity": 0.01,
     "w_invalid": 10.0,
     "w_diversity": 0.5,
     "diversity_cap": 0.10,
     "w_sensitivity": 0.5,
     "sensitivity_cap": 0.10,
     "w_jitter": 0.25,
+    "w_ood": 2.0,
     "diversity_samples": 8
+  },
+
+  "calibration_rule": {
+    "description": "Pre-specified, controller-agnostic proposal rule: continuous targets = [q25, q75] of the POOLED pilot outcomes of all collection policies; death targets keep the design ceiling. The rule never looks at which controller performs best.",
+    "continuous_quantiles": [0.25, 0.75]
   },
 
   "seed_blocks": {

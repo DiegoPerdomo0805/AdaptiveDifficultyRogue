@@ -43,7 +43,7 @@ def test_eval_seed_guards(pilot_csv):
 
 def test_equivalent_seed_evaluation_end_to_end(trained, tmp_path):
     out = tmp_path / "eval"
-    rc = evaluate_controllers.main(["--controllers", "fixed,heuristic,cgan", "--model-dir",
+    rc = evaluate_controllers.main(["--axis", "enemy", "--controllers", "fixed,heuristic,cgan", "--model-dir",
                                     trained["model_dir"], "--runs", "20", "--seed", "9000000",
                                     "--out-dir", str(out), "--train-csv", trained["csv"],
                                     "--bootstrap", "50"])
@@ -51,12 +51,21 @@ def test_equivalent_seed_evaluation_end_to_end(trained, tmp_path):
     s = json.load(open(out / "summary.json"))
     assert set(s["controllers"]) == {"fixed", "heuristic", "cgan"}
     assert all(s["controllers"][c]["n_runs"] == 20 for c in s["controllers"])
-    assert s["controllers"]["cgan"]["fallback_rows"] == 0
+    cg = s["controllers"]["cgan"]
+    # only recorded OOD-guard fallbacks are acceptable, and they must be rare
+    assert all(k.startswith("ood_action:") for k in cg["fallback_reasons"])
+    assert cg["fallback_rows"] <= 0.1 * cg["n_combat_rooms"]
     assert s["paired"]["vs_heuristic"]["cgan"]["n_pairs"] == 20
-    assert json.load(open(out / "model_diagnostics.json"))["validity"] == 1.0
+    d = json.load(open(out / "model_diagnostics.json"))
+    assert d["validity"] == 1.0 and 0.0 <= d["ood_rate"] <= 1.0
+    for c in s["controllers"].values():                       # boss rows: shared policy everywhere
+        assert c["boss_rows_shared_policy"] is True
+    assert "boss_survival" in s["controllers"]["cgan"]["metrics"]
+    pvo = s["predicted_vs_observed"]["by_condition"]
+    assert set(pvo) == {"fixed", "heuristic", "cgan"}
     seeds = {c: sorted({r["run_seed"] for r in csv.DictReader(open(out / f"eval_{c}.csv"))})
              for c in ("fixed", "heuristic", "cgan")}
     assert seeds["fixed"] == seeds["heuristic"] == seeds["cgan"]
     with pytest.raises(SystemExit):     # refuses to overwrite an experiment
-        evaluate_controllers.main(["--controllers", "fixed", "--runs", "2", "--seed", "9000000",
+        evaluate_controllers.main(["--axis", "enemy", "--controllers", "fixed", "--runs", "2", "--seed", "9000000",
                                    "--out-dir", str(out)])

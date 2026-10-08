@@ -22,23 +22,26 @@ def test_q_shapes_and_finite_loss():
     a = torch.rand(16, core.ACTION_DIM)
     out = q(x, a)
     assert out.shape == (16, balance.OUTCOME_DIM)
-    loss, bce, mse = models.q_loss(out, torch.randint(0, 2, (16,)).float(), torch.randn(16, 4))
+    loss, bce, mse = models.q_loss(out, torch.randint(0, 2, (16,)).float(), torch.rand(16, 4), torch.ones(4))
     assert torch.isfinite(loss)
     loss.backward()
     qx = models.OutcomeModel(use_action=False)
     assert qx(x).shape == (16, balance.OUTCOME_DIM)
 
 
+def _support(n=64):
+    return models.SupportModel.fit(torch.randn(n, core.COND_DIM), torch.rand(n, core.ACTION_DIM), 5, 0.95, 1000)
+
+
 def test_generator_objective_has_no_reconstruction_term():
     params = list(inspect.signature(models.generator_loss).parameters)
-    assert params == ["gen", "disc", "q", "out_scaler", "x_s", "lambda_balance",
-                      "lambda_diversity", "diversity_tau", "exp_cfg"]
+    assert params == ["gen", "disc", "q", "support", "x_s", "lambda_balance",
+                      "lambda_diversity", "diversity_tau", "lambda_support", "exp_cfg"]
     q = models.freeze(models.OutcomeModel())
-    terms = models.generator_loss(models.Generator(), models.Discriminator(), q,
-                                  models.OutcomeScaler([0.5] * 4, [0.2] * 4),
-                                  torch.randn(8, core.COND_DIM), 1.0, 1.0, 0.05)
+    terms = models.generator_loss(models.Generator(), models.Discriminator(), q, _support(),
+                                  torch.randn(8, core.COND_DIM), 1.0, 1.0, 0.05, 1.0)
     assert set(terms) == {"total", *models.GENERATOR_LOSS_TERMS}
-    assert set(models.GENERATOR_LOSS_TERMS) == {"adv", "balance", "diversity"}
+    assert set(models.GENERATOR_LOSS_TERMS) == {"adv", "balance", "diversity", "support"}
     src = inspect.getsource(train_cgan)
     assert "mse_loss" not in src and "l1_loss" not in src
     # frozen Q receives no gradient
@@ -79,7 +82,8 @@ def test_checkpoint_contents(trained):
     for key in ("generator_state_dict", "discriminator_state_dict", "q_state_dict", "optimizer_g_state",
                 "optimizer_d_state", "epoch", "best_score", "seed", "hparams", "cond_columns",
                 "action_columns", "outcome_columns", "cond_scaler", "outcome_scaler", "history",
-                "config_hash", "experiment_config_hash", "dda_version", "dataset_schema_version"):
+                "config_hash", "experiment_config_hash", "dda_version", "dataset_schema_version",
+                "support_state", "action_support_box"):
         assert key in ck, key
 
 
@@ -102,6 +106,7 @@ def _save_variant(trained, tmp_path, mutate):
     lambda c: c.update(experiment_config_hash="0000"),
     lambda c: c.update(config_hash="deadbeefdeadbeef"),
     lambda c: c["cond_scaler"].update(std=[0.0] * 9),
+    lambda c: c.pop("support_state"),
 ])
 def test_incompatible_checkpoints_rejected(trained, tmp_path, mutate):
     d = _save_variant(trained, tmp_path, mutate)
@@ -112,6 +117,7 @@ def test_incompatible_checkpoints_rejected(trained, tmp_path, mutate):
 def test_runtime_predict_bounded_and_fallback_on_incompatible(trained, tmp_path):
     lm = model_runtime.LoadedModels.load(trained["model_dir"])
     a = lm.predict([0.5, 0.5, 2.0, 2.0, 0.3, 0.8, 0.2, 0.3, 0.4])
+    assert a.pop("_support_distance") >= 0.0
     for k in core.ACTION_KEYS:
         lo, hi = core.ACTION_BOUNDS[k]
         assert lo <= a[k] <= hi
@@ -157,5 +163,8 @@ def test_bot_runner_records_cgan_fallback(tmp_path):
     p = make_dataset(tmp_path / "f.csv", runs=5, controller="cgan",
                      extra=("--model-dir", str(tmp_path / "missing")))
     rows = list(csv.DictReader(open(p)))
-    assert rows and all(r["fallback_used"] == "1" and r["fallback_reason"].startswith("load_error")
-                        for r in rows)
+    enemy = [r for r in rows if r["room_kind"] == "enemy"]
+    assert enemy and all(r["fallback_used"] == "1" and r["fallback_reason"].startswith("load_error")
+                         for r in enemy)
+    # boss and enemy-free rooms never invoke the enemy model, so they never fall back
+    assert all(r["fallback_used"] == "0" for r in rows if r["room_kind"] != "enemy")

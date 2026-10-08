@@ -68,5 +68,6 @@ def test_experiment_config_targets_not_in_model_code():
     import inspect
     models = pytest.importorskip("models")
     src = inspect.getsource(models)
-    for col, t in balance.load_experiment_config()["balance_targets"].items():
+    cfg = balance.load_experiment_config()
+    for col, t in {**cfg["enemy_balance_targets"], **cfg["loot_horizon_balance_targets"]}.items():
         assert f'"{col}": {{"low"' not in src

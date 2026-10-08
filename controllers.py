@@ -16,8 +16,9 @@ DDA controllers that choose the 4-dim enemy intervention for a room:
 Every controller returns a Decision whose `action` has already passed
 dda_core.finalize_action() (finite, clamped, int spawn_count). Room-kind
 modifiers (boss) are applied afterwards by dda_core.effective_applied_config()
-exactly as for gameplay. Loot bias is NOT learned: every controller uses the
-heuristic loot bias so the comparison isolates the enemy intervention.
+exactly as for gameplay. Loot is decided by the independent reward policy
+(rewards.py), never by the enemy controller. Boss rooms always use the shared
+deterministic boss policy (shared_boss_decision) and never call a controller.
 
 Stdlib-only except CGANController, which imports torch via model_runtime.
 """
@@ -54,13 +55,14 @@ class DecisionContext:
 
 @dataclass
 class Decision:
-    action: dict                      # finalized raw action (+ loot_bias)
+    action: dict                      # finalized raw action
     controller_type: str
     controller_version: str
     model_checkpoint_id: str = ""
     action_source: str = ""
     fallback_used: int = 0
     fallback_reason: str = ""
+    support_distance: str = ""        # model decisions only (kNN distance to training support)
 
     def meta(self) -> dict:
         return {
@@ -70,6 +72,7 @@ class Decision:
             "action_source": self.action_source,
             "fallback_used": self.fallback_used,
             "fallback_reason": self.fallback_reason,
+            "support_distance": self.support_distance,
         }
 
 
@@ -78,7 +81,7 @@ class Controller:
 
     def __init__(self, cfg: Optional[dict] = None):
         self.cfg = cfg or balance.load_experiment_config()
-        self.version = self.cfg["controllers"][self.controller_type]["version"]
+        self.version = self.cfg["enemy_controller"][self.controller_type]["version"]
 
     def begin_run(self, run_seed: int):
         """Reseed per-run state. Called once at the start of every run."""
@@ -91,16 +94,15 @@ class Controller:
 
     @staticmethod
     def _with_loot(action: dict, ctx: DecisionContext) -> dict:
-        out = core.finalize_action(action)
-        out["loot_bias"] = core.loot_bias_for_metrics(ctx.metrics)
-        return out
+        # Loot is decided by the independent reward policy (rewards.py).
+        return core.finalize_action(action)
 
 
 class FixedController(Controller):
     controller_type = "fixed"
 
     def decide(self, ctx):
-        action = dict(self.cfg["controllers"]["fixed"]["action"])
+        action = dict(self.cfg["enemy_controller"]["fixed"]["action"])
         return Decision(self._with_loot(action, ctx), "fixed", self.version, action_source="fixed")
 
 
@@ -119,7 +121,7 @@ class ExplorationController(Controller):
 
     def __init__(self, cfg=None):
         super().__init__(cfg)
-        self.ecfg = self.cfg["controllers"]["exploration"]
+        self.ecfg = self.cfg["enemy_controller"]["exploration"]
         self.rng = random.Random(0)
 
     def begin_run(self, run_seed: int):
@@ -158,6 +160,29 @@ class ExplorationController(Controller):
         return d
 
 
+def shared_boss_decision(cfg: Optional[dict] = None) -> Decision:
+    """The deterministic boss policy shared by EVERY experimental condition.
+    No enemy model is invoked in boss rooms."""
+    sb = (cfg or balance.load_experiment_config())["shared_boss"]
+    return Decision(core.finalize_action(dict(sb["raw_action"])), "shared_boss", sb["version"],
+                    action_source="shared_boss")
+
+
+def decide_room(controller: "Controller", ctx: DecisionContext) -> Decision:
+    """Room-kind dispatch used by bot_runner.py and rogue.py:
+      boss            -> shared_boss_decision (identical for all conditions)
+      enemy           -> the run's enemy controller
+      loot / nothing  -> no enemies: a logged, never-applied placeholder
+                         action and NO controller/model call."""
+    if ctx.room_kind == "boss":
+        return shared_boss_decision(controller.cfg)
+    if ctx.room_kind == "enemy":
+        return controller.decide(ctx)
+    placeholder = dict(controller.cfg["enemy_controller"]["non_combat_action"])
+    return Decision(core.finalize_action(placeholder), controller.controller_type, controller.version,
+                    action_source="non_combat")
+
+
 def load_model_runtime():
     """Import model_runtime.py by path (independent of cwd / sys.path)."""
     if "model_runtime" in sys.modules:
@@ -185,11 +210,12 @@ class CGANController(Controller):
     def __init__(self, model_dir: str, cfg=None, models=None):
         super().__init__(cfg)
         self.model_dir = model_dir
-        self.max_invalid = int(self.cfg["controllers"]["cgan"].get("max_invalid_outputs", 3))
+        self.max_invalid = int(self.cfg["enemy_controller"]["cgan"].get("max_invalid_outputs", 3))
         self.fallback = HeuristicController(self.cfg)
         self.models = models
         self.load_error = ""
         self.invalid_count = 0
+        self.ood_count = 0
         self.disabled = False
         self.noise_rng = random.Random(0)
         if self.models is None:
@@ -217,12 +243,19 @@ class CGANController(Controller):
         try:
             action = self.models.predict(ctx.cond_vec, noise=noise)
         except Exception as e:
+            if type(e).__name__ == "OODAction":
+                # Outside the training action support: unsafe to trust Q's
+                # extrapolation, but not a malfunction -> per-room fallback.
+                self.ood_count += 1
+                return self._fallback(ctx, f"ood_action:{str(e)[:120]}")
             self.invalid_count += 1
             if self.invalid_count >= self.max_invalid:
                 self.disabled = True
             return self._fallback(ctx, f"invalid_output:{type(e).__name__}:{str(e)[:120]}")
+        support = action.pop("_support_distance", "")
         return Decision(self._with_loot(action, ctx), "cgan", self.version,
-                        model_checkpoint_id=self.checkpoint_id, action_source="model")
+                        model_checkpoint_id=self.checkpoint_id, action_source="model",
+                        support_distance=f"{support:.4f}" if support != "" else "")
 
     def describe(self):
         d = super().describe()

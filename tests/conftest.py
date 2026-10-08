@@ -22,7 +22,8 @@ def make_dataset(path, runs=40, seed=100000, controller="heuristic", extra=()):
 @pytest.fixture(scope="session")
 def pilot_csv(tmp_path_factory):
     d = tmp_path_factory.mktemp("pilot")
-    return make_dataset(d / "pilot.csv", runs=200, controller=PILOT_MIX)
+    return make_dataset(d / "pilot.csv", runs=200, controller=PILOT_MIX,
+                        extra=("--reward-policy", "exploration"))
 
 
 @pytest.fixture(scope="session")
@@ -34,6 +35,6 @@ def trained(tmp_path_factory, pilot_csv):
     d = tmp_path_factory.mktemp("models")
     q_dir, m_dir = str(d / "q"), str(d / "m")
     train_q.main(["--csv", pilot_csv, "--out-dir", q_dir, "--epochs", "40", "--patience", "10"])
-    train_cgan.main(["--csv", pilot_csv, "--q-dir", q_dir, "--out-dir", m_dir, "--epochs", "6",
+    train_cgan.main(["--csv", pilot_csv, "--q-dir", q_dir, "--out-dir", m_dir, "--epochs", "15",
                      "--allow-failed-q-gate"])
     return {"csv": pilot_csv, "q_dir": q_dir, "model_dir": m_dir}

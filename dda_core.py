@@ -156,55 +156,124 @@ def apply_knockback_decay(kvx: float, kvy: float, dt: float) -> tuple:
 # Loadout dataclasses + fixed pools
 # ---------------------------------------------------------------------------
 
-@dataclass
+# Item definitions and statistics are FIXED (project scope). `item_id` is the
+# stable identifier used in telemetry and models; display names are not.
+
+@dataclass(frozen=True)
 class Weapon:
     name: str
     dmg: float
     cd_mult: float
     heal_mult: float
+    item_id: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Spell:
     name: str
     dmg: float
     cd_mult: float
     ammo_max: int
+    item_id: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Boots:
+    # NOTE: dash_dist_mult is displayed in rogue.py's loot UI but is NOT read
+    # by any game mechanic (the dash always travels DASH_SPEED * DASH_TIME).
+    # Boots are therefore functionally inert in the human game, and the bot
+    # treats them as inert too (semantic parity; see README equipment audit).
     name: str
     dash_dist_mult: float
+    item_id: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Armor:
     name: str
     dmg_absorb: float
     heal_on_kill_bonus: int
+    item_id: str = ""
 
 
 WEAPONS = [
-    Weapon("Sword", dmg=14, cd_mult=1.00, heal_mult=1.00),
-    Weapon("Hatchet", dmg=20, cd_mult=1.12, heal_mult=1.05),
-    Weapon("Rapier", dmg=10, cd_mult=0.80, heal_mult=0.95),
+    Weapon("Sword", dmg=14, cd_mult=1.00, heal_mult=1.00, item_id="weapon.sword"),
+    Weapon("Hatchet", dmg=20, cd_mult=1.12, heal_mult=1.05, item_id="weapon.hatchet"),
+    Weapon("Rapier", dmg=10, cd_mult=0.80, heal_mult=0.95, item_id="weapon.rapier"),
 ]
 SPELLS = [
-    Spell("Magic Bolt", dmg=10, cd_mult=1.00, ammo_max=12),
-    Spell("Magic Spike", dmg=8, cd_mult=0.78, ammo_max=16),
-    Spell("Hex Bomb", dmg=30, cd_mult=1.25, ammo_max=9),
+    Spell("Magic Bolt", dmg=10, cd_mult=1.00, ammo_max=12, item_id="spell.magic_bolt"),
+    Spell("Magic Spike", dmg=8, cd_mult=0.78, ammo_max=16, item_id="spell.magic_spike"),
+    Spell("Hex Bomb", dmg=30, cd_mult=1.25, ammo_max=9, item_id="spell.hex_bomb"),
 ]
 BOOTS = [
-    Boots("Leather Boots", dash_dist_mult=1.00),
-    Boots("Sprint Greaves", dash_dist_mult=1.25),
-    Boots("Voidstep Treads", dash_dist_mult=1.45),
+    Boots("Leather Boots", dash_dist_mult=1.00, item_id="boots.leather"),
+    Boots("Sprint Greaves", dash_dist_mult=1.25, item_id="boots.sprint_greaves"),
+    Boots("Voidstep Treads", dash_dist_mult=1.45, item_id="boots.voidstep_treads"),
 ]
 ARMORS = [
-    Armor("Cloth Wrap", dmg_absorb=0.5, heal_on_kill_bonus=0),
-    Armor("Chain Shirt", dmg_absorb=2.0, heal_on_kill_bonus=0),
-    Armor("Blood Harness", dmg_absorb=1.0, heal_on_kill_bonus=6),
+    Armor("Cloth Wrap", dmg_absorb=0.5, heal_on_kill_bonus=0, item_id="armor.cloth_wrap"),
+    Armor("Chain Shirt", dmg_absorb=2.0, heal_on_kill_bonus=0, item_id="armor.chain_shirt"),
+    Armor("Blood Harness", dmg_absorb=1.0, heal_on_kill_bonus=6, item_id="armor.blood_harness"),
 ]
+
+SLOTS = ["weapon", "spell", "armor", "boots"]          # == LOOT_KINDS order
+ITEMS_BY_SLOT = {"weapon": WEAPONS, "spell": SPELLS, "armor": ARMORS, "boots": BOOTS}
+ITEM_BY_ID = {it.item_id: it for items in ITEMS_BY_SLOT.values() for it in items}
+SLOT_OF_ITEM = {it.item_id: slot for slot, items in ITEMS_BY_SLOT.items() for it in items}
+ALL_ITEM_IDS = [it.item_id for slot in SLOTS for it in ITEMS_BY_SLOT[slot]]
+
+
+@dataclass
+class Equipment:
+    """The player's loadout: one fixed item per slot."""
+    weapon: Weapon
+    spell: Spell
+    armor: Armor
+    boots: Boots
+
+    def ids(self) -> dict:
+        return {s: getattr(self, s).item_id for s in SLOTS}
+
+    def equip(self, slot: str, item) -> bool:
+        """Equip `item` in `slot`; returns True if a DIFFERENT item was replaced."""
+        if slot not in SLOTS or SLOT_OF_ITEM.get(item.item_id) != slot:
+            raise ValueError(f"item {item!r} does not belong to slot {slot!r}")
+        replaced = getattr(self, slot).item_id != item.item_id
+        setattr(self, slot, item)
+        return replaced
+
+
+def random_equipment(rng) -> Equipment:
+    """Starting loadout: one uniformly chosen item per slot (same rule for the
+    human game and the bot; the RNG is derived from run_seed)."""
+    return Equipment(weapon=rng.choice(WEAPONS), spell=rng.choice(SPELLS),
+                     armor=rng.choice(ARMORS), boots=rng.choice(BOOTS))
+
+
+# ---------------------------------------------------------------------------
+# Item effects -- THE single implementation used by both rogue.Player and the
+# bot's abstract combat, so an item has the same functional meaning in both.
+# ---------------------------------------------------------------------------
+
+def incoming_damage(raw_amount: float, armor: Armor, defending: bool) -> float:
+    """Armor absorbs a flat amount per hit, then defending scales the rest."""
+    amount = max(0.0, raw_amount - armor.dmg_absorb)
+    if defending:
+        amount *= DEFEND_DMG_MULT
+    return amount
+
+
+def heal_on_kill_amount(weapon: Weapon, armor: Armor) -> int:
+    return int(HEAL_ON_KILL_BASE * weapon.heal_mult) + armor.heal_on_kill_bonus
+
+
+def melee_cooldown(weapon: Weapon) -> float:
+    return MELEE_CD_BASE * weapon.cd_mult
+
+
+def magic_cooldown(spell: Spell) -> float:
+    return MAGIC_CD_BASE * spell.cd_mult
 
 # ---------------------------------------------------------------------------
 # Combat metrics + condition vector (THE single definition)
@@ -496,6 +565,11 @@ import hashlib
 import json
 
 
+def _item_table() -> dict:
+    from dataclasses import asdict
+    return {slot: [asdict(i) for i in items] for slot, items in ITEMS_BY_SLOT.items()}
+
+
 def config_hash(extra: Optional[dict] = None) -> str:
     """
     Stable short hash over every tunable this module owns. A change to any
@@ -557,6 +631,9 @@ def config_hash(extra: Optional[dict] = None) -> str:
         "BOSS_HP_MULT": BOSS_HP_MULT, "BOSS_DMG_MULT": BOSS_DMG_MULT,
         "BOSS_SPEED_MULT": BOSS_SPEED_MULT, "BOSS_SPAWN_N": BOSS_SPAWN_N,
 
+        "ITEMS": _item_table(),
+        "HEAL_ON_KILL_BASE": HEAL_ON_KILL_BASE,
+        "DEFEND_DMG_MULT": DEFEND_DMG_MULT,
         "LOOT_BIAS_KNIGHT": LOOT_BIAS_KNIGHT,
         "LOOT_BIAS_BERSERKER": LOOT_BIAS_BERSERKER,
         "LOOT_BIAS_SNIPER": LOOT_BIAS_SNIPER,

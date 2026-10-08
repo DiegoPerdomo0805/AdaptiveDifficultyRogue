@@ -77,10 +77,12 @@ def dataset_stats(csv_paths: List[str], project_rooms: int = 0) -> dict:
     for r in rows:
         runs.setdefault(r["run_id"], []).append(r)
     run_ctrl: Dict[str, int] = {}
+    run_rew: Dict[str, int] = {}
     victories = deaths = boss_reach = 0
     for rid, rr in runs.items():
         rr.sort(key=lambda r: int(r["room_seq"]))
-        run_ctrl[rr[0]["controller_type"]] = run_ctrl.get(rr[0]["controller_type"], 0) + 1
+        run_ctrl[rr[0]["enemy_controller"]] = run_ctrl.get(rr[0]["enemy_controller"], 0) + 1
+        run_rew[rr[0]["reward_policy"]] = run_rew.get(rr[0]["reward_policy"], 0) + 1
         if any(r["died_in_room"] == "1" for r in rr):
             deaths += 1
         if any(r["room_kind"] == "boss" for r in rr):
@@ -88,12 +90,12 @@ def dataset_stats(csv_paths: List[str], project_rooms: int = 0) -> dict:
             if any(r["room_kind"] == "boss" and r["room_result"] == "cleared" for r in rr):
                 victories += 1
 
-    combat = [r for r in rows if r["is_combat_room"] == "1" and r["room_kind"] != "boss"]
+    combat = [r for r in rows if r["room_kind"] == "enemy"]     # ordinary combat rooms
     out = {
         "files": csv_paths, "n_rows": len(rows), "n_runs": len(runs),
         "n_combat_rooms_nonboss": len(combat),
         "n_boss_rooms": sum(1 for r in rows if r["room_kind"] == "boss"),
-        "runs_by_controller": run_ctrl,
+        "runs_by_controller": run_ctrl, "runs_by_reward_policy": run_rew,
         "rows_by_controller": {}, "combat_rooms_by_action_source": {},
         "run_outcomes": {"deaths": deaths, "victories": victories, "boss_reached": boss_reach,
                          "death_rate": deaths / max(len(runs), 1),
@@ -102,7 +104,7 @@ def dataset_stats(csv_paths: List[str], project_rooms: int = 0) -> dict:
         "duplicate_keys": dup,
     }
     for r in rows:
-        out["rows_by_controller"][r["controller_type"]] = out["rows_by_controller"].get(r["controller_type"], 0) + 1
+        out["rows_by_controller"][r["enemy_controller"]] = out["rows_by_controller"].get(r["enemy_controller"], 0) + 1
     for r in combat:
         out["combat_rooms_by_action_source"][r["action_source"]] = \
             out["combat_rooms_by_action_source"].get(r["action_source"], 0) + 1
@@ -129,7 +131,7 @@ def dataset_stats(csv_paths: List[str], project_rooms: int = 0) -> dict:
 
     cov = {}
     for ctrl in sorted(set(r["controller_type"] for r in combat)):
-        sub = [r for r in combat if r["controller_type"] == ctrl]
+        sub = [r for r in combat if r["controller_type"] == ctrl]   # ordinary rooms: == enemy_controller
         acts = ml_data.action_matrix(sub)
         heur = [ml_data.heuristic_action_for_row(r) for r in sub]
         per = {}
@@ -149,6 +151,19 @@ def dataset_stats(csv_paths: List[str], project_rooms: int = 0) -> dict:
                     flags.append(f"exploration action {col} barely varies (std_normalized {s['std_normalized']:.3f})")
     out["action_coverage"] = cov
 
+    loot = [r for r in rows if r["loot_event_id"]]
+    out["loot"] = {"events": len(loot),
+                   "selected_categories": {c: sum(1 for r in loot if r["selected_category"] == c)
+                                           for c in list(core.SLOTS) + ["none"]},
+                   "selected_items": {i: sum(1 for r in loot if r["selected_item_id"] == i)
+                                      for i in core.ALL_ITEM_IDS},
+                   "reward_fallback_events": sum(1 for r in loot if r["reward_fallback_used"] == "1")}
+    out["boss_rows_shared_policy"] = all(r["controller_type"] == "shared_boss"
+                                         for r in rows if r["room_kind"] == "boss")
+    if not out["boss_rows_shared_policy"]:
+        flags.append("boss rows not decided by the shared boss policy")
+    if loot and any(v == 0 for c, v in out["loot"]["selected_categories"].items() if c != "none"):
+        flags.append("a loot category was never selected")
     if runs and (out["run_outcomes"]["death_rate"] > 0.95 or out["run_outcomes"]["victory_rate"] > 0.95):
         flags.append("run outcomes collapsed (almost every run dies or wins)")
 
@@ -230,7 +245,10 @@ def main(argv=None):
             json.dump(st, f, indent=2, default=float)
     print(f"rows={st['n_rows']} runs={st['n_runs']} combat(non-boss)={st['n_combat_rooms_nonboss']} "
           f"boss_rooms={st['n_boss_rooms']}")
-    print("runs by controller:", st["runs_by_controller"])
+    print("runs by enemy controller:", st["runs_by_controller"], "| by reward policy:",
+          st["runs_by_reward_policy"])
+    print("loot:", st["loot"]["events"], "events, categories", st["loot"]["selected_categories"],
+          "| boss rows shared policy:", st["boss_rows_shared_policy"])
     print("combat rooms by action source:", st["combat_rooms_by_action_source"])
     print("run outcomes:", {k: round(v, 3) if isinstance(v, float) else v
                             for k, v in st["run_outcomes"].items()},

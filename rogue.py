@@ -75,6 +75,30 @@ def angle_diff_deg(a, b):
 # ---------------------------------------------------------------------------
 
 CONTROLLER_NAME = os.environ.get("ROGUE_CONTROLLER", "cgan" if ENABLE_MODEL else "heuristic")
+# Reward policy (independent of the enemy controller):
+# ROGUE_REWARD_POLICY=fixed_uniform|heuristic|learned_loot (default heuristic),
+# ROGUE_LOOT_MODEL_DIR for learned_loot (falls back to the heuristic, logged).
+REWARD_POLICY_NAME = os.environ.get("ROGUE_REWARD_POLICY", "heuristic")
+LOOT_MODEL_DIR = os.environ.get(
+    "ROGUE_LOOT_MODEL_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "loot_model_out"),
+)
+
+
+def make_game_reward_policy(name: str = None):
+    import rewards
+    name = name or REWARD_POLICY_NAME
+    if name not in ("fixed_uniform", "heuristic", "learned_loot"):
+        raise ValueError(f"ROGUE_REWARD_POLICY must be fixed_uniform|heuristic|learned_loot, got {name!r}")
+    pol = rewards.make_reward_policy(name, loot_model_dir=LOOT_MODEL_DIR)
+    if getattr(pol, "load_error", ""):
+        print(f"[LOOT] learned_loot unavailable, falling back: {pol.load_error}", file=sys.stderr)
+    return pol
+
+
+def run_loadout(run_seed: int) -> "core.Equipment":
+    import controllers
+    return core.random_equipment(random.Random(controllers.derive_seed(run_seed, "loadout")))
 
 
 def make_game_controller(name: str = None):
@@ -226,16 +250,16 @@ class Enemy:
 
 
 class Player:
-    def __init__(self, x, y):
+    def __init__(self, x, y, equipment: Optional["core.Equipment"] = None):
         self.x, self.y = x, y
         self.r = 18
         self.max_hp = 100
         self.hp = 100
 
-        self.weapon = random.choice(WEAPONS)
-        self.spell = random.choice(SPELLS)
-        self.boots = random.choice(BOOTS)
-        self.armor = random.choice(ARMORS)
+        # One fixed item per slot (dda_core.Equipment). The starting loadout
+        # is a uniform draw per slot -- the same rule the bot uses -- from an
+        # RNG derived from the run seed when one is supplied.
+        self.equipment = equipment or core.random_equipment(random)
 
         self.facing_deg = 0.0
         self.melee_cd = 0.0
@@ -259,27 +283,44 @@ class Player:
         # unlocked doorway far enough to trigger a room transition.
         self.exit_dir: Optional[str] = None
 
+    @property
+    def weapon(self):
+        return self.equipment.weapon
+
+    @property
+    def spell(self):
+        return self.equipment.spell
+
+    @property
+    def boots(self):
+        return self.equipment.boots
+
+    @property
+    def armor(self):
+        return self.equipment.armor
+
     def hp_ratio(self) -> float:
         return core.clamp(self.hp / self.max_hp, 0.0, 1.0)
 
-    def set_loadout(self, weapon=None, spell=None, boots=None, armor=None):
-        if weapon: self.weapon = weapon
+    def set_loadout(self, weapon=None, spell=None, boots=None, armor=None) -> bool:
+        replaced = False
+        for slot, item in (("weapon", weapon), ("spell", spell), ("boots", boots), ("armor", armor)):
+            if item:
+                replaced = self.equipment.equip(slot, item) or replaced
         if spell:
-            self.spell = spell
             self.magic_ammo = min(self.magic_ammo, self.spell.ammo_max)
-        if boots: self.boots = boots
-        if armor: self.armor = armor
+        return replaced
 
     def heal_on_kill(self):
-        heal = int(HEAL_ON_KILL_BASE * self.weapon.heal_mult) + self.armor.heal_on_kill_bonus
+        # Shared with the bot (dda_core.heal_on_kill_amount).
+        heal = core.heal_on_kill_amount(self.weapon, self.armor)
         self.hp = min(self.max_hp, self.hp + heal)
 
     def receive_damage(self, raw_amount, knock_dir: Optional[Tuple[float, float]] = None):
         if not self.alive:
             return
-        amount = max(0.0, raw_amount - self.armor.dmg_absorb)
-        if self.defending:
-            amount *= DEFEND_DMG_MULT
+        # Shared with the bot (dda_core.incoming_damage): armor absorb, then defend.
+        amount = core.incoming_damage(raw_amount, self.armor, self.defending)
         self.hp -= amount
         self.metrics.damage_taken += amount
         if knock_dir is not None and amount > 0:
@@ -368,7 +409,7 @@ class Player:
     def try_melee(self, enemies: List[Enemy]):
         if not self.alive or self.melee_cd > 0.0:
             return False
-        self.melee_cd = MELEE_CD_BASE * self.weapon.cd_mult
+        self.melee_cd = core.melee_cooldown(self.weapon)
         hit_any = False
         for e in enemies:
             if not e.alive:
@@ -389,7 +430,7 @@ class Player:
     def try_magic(self, projectiles: List[Projectile]):
         if not self.alive or self.magic_cd > 0.0 or self.magic_ammo <= 0:
             return
-        self.magic_cd = MAGIC_CD_BASE * self.spell.cd_mult
+        self.magic_cd = core.magic_cooldown(self.spell)
         self.magic_ammo -= 1
         rad = math.radians(self.facing_deg)
         vx = math.cos(rad) * PROJECTILE_SPEED
@@ -437,17 +478,13 @@ def describe_loot_option(kind: str, item: object) -> List[str]:
     return [f"Item: {item.name}"]
 
 
-def apply_loot_choice(player: Player, choice: Tuple[str, object]):
+def apply_loot_choice(player: Player, choice: Tuple[str, object]) -> bool:
+    """Equips the chosen item; returns True if a different item was replaced."""
     kind, item = choice
-    if kind == "weapon":
-        player.set_loadout(weapon=item)
-    elif kind == "spell":
-        player.set_loadout(spell=item)
+    replaced = player.set_loadout(**{kind: item})
+    if kind == "spell":
         player.magic_ammo = player.spell.ammo_max
-    elif kind == "boots":
-        player.set_loadout(boots=item)
-    elif kind == "armor":
-        player.set_loadout(armor=item)
+    return replaced
 
 
 # ---------------------------------------------------------------------------
@@ -465,15 +502,19 @@ def apply_loot_choice(player: Player, choice: Tuple[str, object]):
 
 class RoomTelemetrySession:
     def __init__(self, writer: "telemetry.ShardWriter", node_map: NodeMap, run_id: str,
-                 run_seed: int = 0, controller=None):
+                 run_seed: int = 0, controller=None, reward_policy=None):
         import balance
         import controllers
+        import rewards
         self.writer = writer
         self.node_map = node_map
         self.run_id = run_id
         self.run_seed = run_seed
         self.controller = controller or controllers.make_controller("heuristic")
         self.controller.begin_run(run_seed)
+        self.reward_policy = reward_policy or rewards.make_reward_policy("heuristic")
+        self.reward_policy.begin_run(run_seed)
+        self.loot_rng = random.Random(controllers.derive_seed(run_seed, "loot"))
         self.exp_version = balance.load_experiment_config()["experiment_config_version"]
         self.depths = compute_node_depth(node_map, node_map.start)
         self.total_rooms = len(node_map.nodes)
@@ -504,9 +545,19 @@ class RoomTelemetrySession:
             pre, self.recent, pre_hp_ratio, depth, progress_norm)
 
         import controllers
-        decision = self.controller.decide(controllers.DecisionContext(
+        import rewards
+        equip_before = player.equipment.ids()
+        decision = controllers.decide_room(self.controller, controllers.DecisionContext(
             cond_vec=cond_vec, metrics=player.metrics, node_depth=depth,
             hp_ratio=pre_hp_ratio, room_kind=node.kind))
+        reward = offers = None
+        if node.kind == "loot":
+            # Offers are drawn ONCE per loot room (re-opening the UI shows the
+            # same offers), from the reward policy's proposed probabilities.
+            reward = self.reward_policy.propose(rewards.LootContext(
+                cond_vec=cond_vec, metrics=player.metrics, equipment=equip_before,
+                node_depth=depth, hp_ratio=pre_hp_ratio))
+            offers = rewards.draw_offers(reward.probs, self.loot_rng, telemetry.N_OFFERS)
         if decision.fallback_used:
             print(f"[MODEL] room {room_idx}: heuristic fallback ({decision.fallback_reason})",
                   file=sys.stderr)
@@ -524,10 +575,16 @@ class RoomTelemetrySession:
             "recent_totals": recent_totals, "recent_n": recent_n,
             "cond_vec": cond_vec, "applied_raw": applied_raw, "applied": applied,
             "room_seq": self.room_seq, "decision": decision,
+            "equip_before": equip_before, "reward": reward, "offers": offers,
         }
         return applied
 
-    def finalize_room(self, player: Player, room_result: str, loot_taken_kind: str = ""):
+    def current_offers(self) -> List[Tuple[str, object]]:
+        """The loot offers of the pending loot room ([] otherwise)."""
+        return list(self._pending["offers"] or []) if self._pending else []
+
+    def finalize_room(self, player: Player, room_result: str, selected_index: int = -1,
+                      replaced: bool = False):
         p = self._pending
         assert p is not None, "finalize_room() called without a matching begin_room()"
 
@@ -538,16 +595,26 @@ class RoomTelemetrySession:
         if room_result != "died":
             self.cleared_count += 1
 
+        loot_event = None
+        if p["offers"] is not None:
+            loot_event = telemetry.make_loot_event(
+                run_id=self.run_id, room_seq=p["room_seq"], reward_meta=p["reward"].meta(),
+                probs=p["reward"].probs, offers=[(k, it.item_id) for k, it in p["offers"]],
+                selection_mechanism="human_choice", selected_index=selected_index,
+                equip_before=p["equip_before"], equip_after=player.equipment.ids(),
+                replaced=replaced)
         sample = telemetry.build_room_sample(
             run_id=self.run_id, run_seed=self.run_seed, player_profile="human",
+            enemy_controller=self.controller.controller_type,
+            reward_policy=self.reward_policy.policy_type,
             room_seq=p["room_seq"], room_idx=p["room_idx"], room_kind=p["room_kind"],
             node_depth=p["depth"], progress_norm=p["progress_norm"],
-            pre=p["pre"], pre_hp_ratio=p["pre_hp_ratio"],
+            pre=p["pre"], pre_hp_ratio=p["pre_hp_ratio"], equip_before=p["equip_before"],
             recent_totals=p["recent_totals"], recent_n=p["recent_n"], cond_vec=p["cond_vec"],
             controller_meta=p["decision"].meta(), applied_raw=p["applied_raw"],
             applied=p["applied"], room_result=room_result, delta=delta,
             time_in_room=post["time_alive"] - p["pre"]["time_alive"],
-            post_hp_ratio=player.hp_ratio(), loot_taken_kind=loot_taken_kind,
+            post_hp_ratio=player.hp_ratio(), loot_event=loot_event,
             experiment_config_version=self.exp_version,
         )
         self.writer.write(sample)
@@ -559,7 +626,7 @@ HUMAN_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_
 
 
 def new_human_telemetry_session(node_map: NodeMap, run_seed: int = 0, controller=None,
-                                log_dir: Optional[str] = None,
+                                log_dir: Optional[str] = None, reward_policy=None,
                                 ) -> Tuple["RoomTelemetrySession", "telemetry.ShardWriter", str]:
     log_dir = log_dir or HUMAN_LOG_DIR
     os.makedirs(log_dir, exist_ok=True)
@@ -567,7 +634,7 @@ def new_human_telemetry_session(node_map: NodeMap, run_seed: int = 0, controller
     shard_path = os.path.join(log_dir, f"human_{run_id}.csv")
     writer = telemetry.open_shard_writer(shard_path)
     session = RoomTelemetrySession(writer, node_map, run_id, run_seed=run_seed,
-                                   controller=controller)
+                                   controller=controller, reward_policy=reward_policy)
     return session, writer, shard_path
 
 
@@ -621,16 +688,19 @@ def main(max_frames: Optional[int] = None):
     arena = pygame.Rect(ARENA_MARGIN, ARENA_MARGIN, W - 2 * ARENA_MARGIN, H - 2 * ARENA_MARGIN)
 
     controller = make_game_controller()
+    reward_policy = make_game_reward_policy()
     run_seed = random.randrange(2**31)
     node_map = generate_node_map_graph(16, seed=run_seed)
     current_node_idx = node_map.start
     node_depths = compute_node_depth(node_map, node_map.start)
 
-    player = Player(*arena.center)
+    player = Player(*arena.center, equipment=run_loadout(run_seed))
     applied = rule_based_dda(player.metrics, node_depth=0, hp_ratio=1.0)
 
-    session, writer, shard_path = new_human_telemetry_session(node_map, run_seed, controller)
-    last_loot_kind = ""
+    session, writer, shard_path = new_human_telemetry_session(
+        node_map, run_seed, controller, reward_policy=reward_policy)
+    loot_selected_idx = -1
+    loot_replaced = False
 
     projectiles: List[Projectile] = []
     enemies: List[Enemy] = []
@@ -653,10 +723,11 @@ def main(max_frames: Optional[int] = None):
         an already-cleared room while backtracking neither respawns enemies
         nor opens a new pending sample.
         """
-        nonlocal enemies, projectiles, applied, last_loot_kind
+        nonlocal enemies, projectiles, applied, loot_selected_idx, loot_replaced
         projectiles = []
         enemies = []
-        last_loot_kind = ""
+        loot_selected_idx = -1
+        loot_replaced = False
 
         node = node_map.nodes[idx]
 
@@ -700,8 +771,9 @@ def main(max_frames: Optional[int] = None):
         node_map = generate_node_map_graph(16, seed=run_seed)
         current_node_idx = node_map.start
         node_depths = compute_node_depth(node_map, node_map.start)
-        player = Player(*arena.center)
-        session, writer, shard_path = new_human_telemetry_session(node_map, run_seed, controller)
+        player = Player(*arena.center, equipment=run_loadout(run_seed))
+        session, writer, shard_path = new_human_telemetry_session(
+            node_map, run_seed, controller, reward_policy=reward_policy)
         state = "arena"
         spawn_room(current_node_idx)
 
@@ -832,7 +904,7 @@ def main(max_frames: Optional[int] = None):
                     if ev.key == pygame.K_e:
                         dist_to_center = vec_len(player.x - arena.centerx, player.y - arena.centery)
                         if dist_to_center <= LOOT_INTERACT_R:
-                            loot_options = generate_loot_options(player, 3, loot_bias=applied.get("loot_bias"))
+                            loot_options = session.current_offers()
                             loot_choice_idx = 0
                             state = "loot_ui"
 
@@ -843,9 +915,9 @@ def main(max_frames: Optional[int] = None):
                         loot_choice_idx = (loot_choice_idx - 1) % len(loot_options)
                     if ev.key == pygame.K_RETURN and loot_options:
                         kind, item = loot_options[loot_choice_idx]
-                        apply_loot_choice(player, (kind, item))
+                        loot_replaced = apply_loot_choice(player, (kind, item))
                         current_node().looted = True
-                        last_loot_kind = kind
+                        loot_selected_idx = loot_choice_idx
                         state = "arena"
 
                 elif ev.key == pygame.K_RETURN and state in ("dead", "win"):
@@ -927,7 +999,8 @@ def main(max_frames: Optional[int] = None):
                         # Non-combat room (nothing/loot) being left for the
                         # first time -- finalize now, capturing whatever
                         # loot was (or wasn't) taken.
-                        session.finalize_room(player, "cleared", loot_taken_kind=last_loot_kind)
+                        session.finalize_room(player, "cleared", selected_index=loot_selected_idx,
+                                              replaced=loot_replaced)
                     node.cleared = True
                     current_node_idx = next_idx
                     spawn_room(current_node_idx)

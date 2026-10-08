@@ -35,7 +35,7 @@ import dda_core as core
 import ml_data
 import telemetry
 
-Q_CHECKPOINT_SCHEMA = "q_outcome_v1"
+Q_CHECKPOINT_SCHEMA = "q_outcome_v2_bounded"
 
 
 def _auc(scores: List[float], labels: List[int]) -> float:
@@ -81,9 +81,11 @@ def _decile_calibration(pred: List[float], obs: List[float]) -> float:
 
 
 def evaluate_predictions(pred_phys: List[List[float]], y: List[List[float]],
-                         train_prevalence: float, train_mean: List[float]) -> Dict[str, dict]:
+                         train_prevalence: float, train_mean: List[float],
+                         columns: List[str] = None) -> Dict[str, dict]:
     """Per-output metrics for physical predictions vs. observed outcomes and
-    naive baselines (train prevalence / train mean)."""
+    naive baselines (train prevalence / train mean). Column 0 is binary."""
+    columns = columns or balance.OUTCOME_COLUMNS
     out: Dict[str, dict] = {}
     eps = 1e-6
     p = [min(max(r[0], eps), 1 - eps) for r in pred_phys]
@@ -94,10 +96,10 @@ def evaluate_predictions(pred_phys: List[List[float]], y: List[List[float]],
     bce0 = -sum(l * math.log(prev) + (1 - l) * math.log(1 - prev) for l in lab) / n
     brier = sum((pi - l) ** 2 for pi, l in zip(p, lab)) / n
     brier0 = sum((prev - l) ** 2 for l in lab) / n
-    out["death"] = {"n": n, "observed_rate": sum(lab) / n, "mean_pred": sum(p) / n,
+    out[columns[0]] = {"n": n, "observed_rate": sum(lab) / n, "mean_pred": sum(p) / n,
                     "bce": bce, "bce_baseline": bce0, "brier": brier, "brier_baseline": brier0,
                     "auc": _auc(p, lab), "ece": _ece(p, lab)}
-    for j, col in enumerate(balance.OUTCOME_COLUMNS[1:], start=1):
+    for j, col in enumerate(columns[1:], start=1):
         pr = [r[j] for r in pred_phys]
         ob = [r[j] for r in y]
         mse = sum((a - b) ** 2 for a, b in zip(pr, ob)) / n
@@ -109,11 +111,13 @@ def evaluate_predictions(pred_phys: List[List[float]], y: List[List[float]],
     return out
 
 
-def aggregate_skill(metrics: Dict[str, dict]) -> float:
+def aggregate_skill(metrics: Dict[str, dict], columns: List[str] = None) -> float:
     """Mean relative improvement over the naive baseline across outputs
-    (death via BCE, continuous via MSE). Higher is better."""
-    vals = [1.0 - metrics["death"]["bce"] / max(metrics["death"]["bce_baseline"], 1e-12)]
-    for col in balance.OUTCOME_COLUMNS[1:]:
+    (binary via BCE, continuous via MSE). Higher is better; 0 = naive."""
+    columns = columns or balance.OUTCOME_COLUMNS
+    b = metrics[columns[0]]
+    vals = [1.0 - b["bce"] / max(b["bce_baseline"], 1e-12)]
+    for col in columns[1:]:
         m = metrics[col]
         vals.append(1.0 - m["mse"] / max(m["mse_baseline"], 1e-12))
     return sum(vals) / len(vals)
@@ -146,23 +150,23 @@ def q_gate(test_xa: dict, test_x: dict, cfg: dict) -> dict:
             "action_gain": gain}
 
 
-def _tensors(rows, cond_scaler, out_scaler, cfg, torch, device):
+def _tensors(rows, cond_scaler, cfg, torch, device):
     x = torch.tensor(cond_scaler.transform(ml_data.cond_matrix(rows)), dtype=torch.float32, device=device)
     a = torch.tensor([ml_data.normalize_action(r) for r in ml_data.action_matrix(rows)],
                      dtype=torch.float32, device=device)
     y = ml_data.outcome_matrix(rows, cfg)
     yd = torch.tensor([r[0] for r in y], dtype=torch.float32, device=device)
-    yc = torch.tensor(out_scaler.transform([r[1:] for r in y]), dtype=torch.float32, device=device)
+    yc = torch.tensor([r[1:] for r in y], dtype=torch.float32, device=device)   # physical units
     return x, a, yd, yc, y
 
 
-def _predict_phys(model, x, a, out_scaler_t, models, torch):
+def _predict_phys(model, x, a, models, torch):
     model.eval()
     with torch.no_grad():
-        return models.outcomes_physical(model(x, a), out_scaler_t).cpu().tolist()
+        return models.outcomes_physical(model(x, a)).cpu().tolist()
 
 
-def train_one(model, tr, va, args, torch, models, log_prefix=""):
+def train_one(model, tr, va, args, torch, models, cont_var, log_prefix=""):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     x, a, yd, yc, _ = tr
     xv, av, ydv, ycv, _ = va
@@ -177,7 +181,7 @@ def train_one(model, tr, va, args, torch, models, log_prefix=""):
         nb = 0
         for s in range(0, n, args.batch_size):
             idx = perm[s:s + args.batch_size]
-            loss, _, _ = models.q_loss(model(x[idx], a[idx]), yd[idx], yc[idx], args.death_weight)
+            loss, _, _ = models.q_loss(model(x[idx], a[idx]), yd[idx], yc[idx], cont_var, args.death_weight)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -185,7 +189,7 @@ def train_one(model, tr, va, args, torch, models, log_prefix=""):
             nb += 1
         model.eval()
         with torch.no_grad():
-            vl, vb, vm = models.q_loss(model(xv, av), ydv, ycv, args.death_weight)
+            vl, vb, vm = models.q_loss(model(xv, av), ydv, ycv, cont_var, args.death_weight)
         history.append({"epoch": epoch, "train_loss": tot / max(nb, 1), "val_loss": float(vl),
                         "val_bce": float(vb), "val_mse": float(vm)})
         if float(vl) < best[0] - 1e-6:
@@ -201,9 +205,11 @@ def train_one(model, tr, va, args, torch, models, log_prefix=""):
             "history": history}
 
 
-def extreme_action_probe(q, cond_scaler, out_scaler_t, rows, torch, models, device):
-    """Q predictions at the box corners / centre for the median test state.
-    Sanity: harder actions should not predict LOWER death than easier ones."""
+def extreme_action_probe(q, cond_scaler, rows, torch, models, device, n_states: int = 50):
+    """Q predictions at the box corners / centre for the median test state,
+    plus the physical range of predictions over ALL 16 corners of the action
+    box for up to n_states test states. Sanity: harder actions should not
+    predict LOWER death than easier ones; ranges must stay physical."""
     xs = ml_data.cond_matrix(rows)
     med = [sorted(c[i] for c in xs)[len(xs) // 2] for i in range(core.COND_DIM)]
     probes = {"easiest": [0.0, 0.0, 0.0, 0.0], "centre": [0.5, 0.5, 0.5, 0.5],
@@ -213,9 +219,22 @@ def extreme_action_probe(q, cond_scaler, out_scaler_t, rows, torch, models, devi
     a = torch.tensor(list(probes.values()), dtype=torch.float32, device=device)
     q.eval()
     with torch.no_grad():
-        y = models.outcomes_physical(q(x, a), out_scaler_t).cpu().tolist()
+        y = models.outcomes_physical(q(x, a)).cpu().tolist()
+        import itertools
+        corners = torch.tensor(list(itertools.product([0.0, 1.0], repeat=4)), dtype=torch.float32, device=device)
+        xs_t = torch.tensor(cond_scaler.transform(xs[:n_states]), dtype=torch.float32, device=device)
+        xx = xs_t.repeat_interleave(len(corners), dim=0)
+        aa = corners.repeat(xs_t.shape[0], 1)
+        yy = models.outcomes_physical(q(xx, aa))
     out = {k: {"action": ml_data.denormalize_action(v), "pred": dict(zip(balance.OUTCOME_COLUMNS, y[i]))}
            for i, (k, v) in enumerate(probes.items())}
+    ranges = balance.output_ranges("enemy")
+    out["corner_prediction_ranges"] = {
+        col: {"min": float(yy[:, j].min()), "max": float(yy[:, j].max()),
+              "physical_range": list(ranges[j]),
+              "inside_physical_range": bool(yy[:, j].min() >= ranges[j][0] - 1e-6
+                                            and yy[:, j].max() <= ranges[j][1] + 1e-6)}
+        for j, col in enumerate(balance.OUTCOME_COLUMNS)}
     out["median_condition"] = dict(zip(ml_data.COND_COLUMNS, med))
     out["death_monotone_easy_lt_hard"] = y[0][0] <= y[2][0]
     out["post_hp_monotone_easy_gt_hard"] = y[0][1] >= y[2][1]
@@ -238,7 +257,6 @@ def main(argv=None):
     ap.add_argument("--split", default="0.70,0.15,0.15", help="train,val,test fractions of run_ids")
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--include-boss", action="store_true")
     ap.add_argument("--device", default="cpu", help="cpu | cuda | auto")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args(argv)
@@ -256,8 +274,7 @@ def main(argv=None):
 
     import bot_runner
     cfg = balance.load_experiment_config()
-    rows, fp = ml_data.load_training_rows(args.csv, include_boss=args.include_boss,
-                                          expected_extra_subset=bot_runner.policy_extra())
+    rows, fp = ml_data.load_training_rows(args.csv, expected_extra_subset=bot_runner.policy_extra())
     fracs = tuple(float(v) for v in args.split.split(","))
     split = ml_data.grouped_split(rows, fracs, seed=args.split_seed)
     tr_rows, va_rows, te_rows = (ml_data.select(rows, split[k]) for k in ("train", "val", "test"))
@@ -268,20 +285,19 @@ def main(argv=None):
     cond_scaler = ml_data.Standardizer.fit(ml_data.cond_matrix(tr_rows), ml_data.COND_COLUMNS)
     y_tr = ml_data.outcome_matrix(tr_rows, cfg)
     out_scaler = ml_data.Standardizer.fit([r[1:] for r in y_tr], balance.OUTCOME_COLUMNS[1:])
-    out_scaler_t = models.OutcomeScaler(out_scaler.mean, out_scaler.std).to(device)
+    cont_var = torch.tensor([s ** 2 for s in out_scaler.std], dtype=torch.float32, device=device)
     train_prev = sum(r[0] for r in y_tr) / len(y_tr)
     train_mean = [sum(r[j] for r in y_tr) / len(y_tr) for j in range(1, balance.OUTCOME_DIM)]
 
-    tr, va, te = (_tensors(r, cond_scaler, out_scaler, cfg, torch, device)
-                  for r in (tr_rows, va_rows, te_rows))
+    tr, va, te = (_tensors(r, cond_scaler, cfg, torch, device) for r in (tr_rows, va_rows, te_rows))
     hp = dict(hidden=args.hidden, layers=args.layers, dropout=args.dropout)
 
     torch.manual_seed(args.seed)
     q_xa = models.OutcomeModel(use_action=True, **hp).to(device)
-    res_xa = train_one(q_xa, tr, va, args, torch, models, "Q(x,a)")
+    res_xa = train_one(q_xa, tr, va, args, torch, models, cont_var, "Q(x,a)")
     torch.manual_seed(args.seed)
     q_x = models.OutcomeModel(use_action=False, **hp).to(device)
-    res_x = train_one(q_x, tr, va, args, torch, models, "Q(x)  ")
+    res_x = train_one(q_x, tr, va, args, torch, models, cont_var, "Q(x)  ")
 
     report = {"n_rows": {"train": len(tr_rows), "val": len(va_rows), "test": len(te_rows)},
               "n_runs": {k: len(v) for k, v in split.items()},
@@ -289,9 +305,9 @@ def main(argv=None):
                   dict(zip(balance.OUTCOME_COLUMNS[1:], train_mean))}
     for name, part in (("val", va), ("test", te)):
         report[name] = {
-            "q_xa": evaluate_predictions(_predict_phys(q_xa, part[0], part[1], out_scaler_t, models, torch),
+            "q_xa": evaluate_predictions(_predict_phys(q_xa, part[0], part[1], models, torch),
                                          part[4], train_prev, train_mean),
-            "q_x": evaluate_predictions(_predict_phys(q_x, part[0], part[1], out_scaler_t, models, torch),
+            "q_x": evaluate_predictions(_predict_phys(q_x, part[0], part[1], models, torch),
                                         part[4], train_prev, train_mean),
         }
         report[name]["skill_q_xa"] = aggregate_skill(report[name]["q_xa"])
@@ -303,12 +319,11 @@ def main(argv=None):
         sub = [r for r in te_rows if r["action_source"] == src]
         if len(sub) < 5:
             continue
-        part = _tensors(sub, cond_scaler, out_scaler, cfg, torch, device)
-        by_src[src] = evaluate_predictions(_predict_phys(q_xa, part[0], part[1], out_scaler_t, models,
-                                                         torch), part[4], train_prev, train_mean)
+        part = _tensors(sub, cond_scaler, cfg, torch, device)
+        by_src[src] = evaluate_predictions(_predict_phys(q_xa, part[0], part[1], models, torch),
+                                           part[4], train_prev, train_mean)
     report["test_by_action_source"] = by_src
-    report["extreme_action_probe"] = extreme_action_probe(q_xa, cond_scaler, out_scaler_t, te_rows,
-                                                          torch, models, device)
+    report["extreme_action_probe"] = extreme_action_probe(q_xa, cond_scaler, te_rows, torch, models, device)
     report["gate"] = q_gate(report["test"]["q_xa"], report["test"]["q_x"], cfg)
 
     ckpt = {
@@ -349,6 +364,10 @@ def main(argv=None):
             m, mx = r["q_xa"][col], r["q_x"][col]
             print(f"   {col:18s} R2 Q(x,a)={m['r2_vs_mean']:.4f}  Q(x)={mx['r2_vs_mean']:.4f}  "
                   f"mse {m['mse']:.4f} (mean {m['mse_baseline']:.4f})")
+    print("physical prediction ranges over all 16 action-box corners:")
+    for col, r in report["extreme_action_probe"]["corner_prediction_ranges"].items():
+        print(f"   {col:18s} [{r['min']:.3f}, {r['max']:.3f}] within {r['physical_range']}: "
+              f"{r['inside_physical_range']}")
     g = report["gate"]
     print(f"Q GATE: {'PASSED' if g['passed'] else 'FAILED'} (action gain {g['action_gain']:.4f})")
     for reason in g["reasons"]:

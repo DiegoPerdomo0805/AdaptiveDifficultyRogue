@@ -56,10 +56,12 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def load_training_rows(csv_paths: Sequence[str], include_boss: bool = False,
+def load_training_rows(csv_paths: Sequence[str],
                        expected_extra_subset: Optional[dict] = None) -> Tuple[List[dict], dict]:
-    """Returns (combat_rows, fingerprint). Raises DatasetVersionError on any
-    validation failure, incompatible mix or duplicate (run_id, room_seq)."""
+    """Returns (ordinary_combat_rows, fingerprint) for ENEMY training. Boss
+    rows are never returned (shared deterministic boss policy; no enemy model
+    is involved there). Raises DatasetVersionError on any validation failure,
+    incompatible mix or duplicate (run_id, room_seq)."""
     if not csv_paths:
         raise DatasetMixError("no dataset CSV given")
     datasets = []
@@ -85,15 +87,14 @@ def load_training_rows(csv_paths: Sequence[str], include_boss: bool = False,
                 if key in seen:
                     raise DatasetMixError(f"duplicate (run_id, room_seq) {key} across datasets")
                 seen.add(key)
-                if r["is_combat_room"] != "1":
+                if r["room_kind"] != "enemy":
                     continue
-                if r["room_kind"] == "boss" and not include_boss:
-                    continue
-                if r["room_kind"] != "boss":
-                    # raw == effective for non-boss rooms (no room-kind modifier)
-                    for rc, ec in zip(ACTION_RAW_COLUMNS, ACTION_COLUMNS):
-                        if abs(float(r[rc]) - float(r[ec])) > 1e-6:
-                            raise DatasetMixError(f"raw/effective action mismatch in {key}")
+                if r["controller_type"] != r["enemy_controller"]:
+                    raise DatasetMixError(f"ordinary room {key} not decided by the run's controller")
+                # raw == effective for ordinary rooms (no room-kind modifier)
+                for rc, ec in zip(ACTION_RAW_COLUMNS, ACTION_COLUMNS):
+                    if abs(float(r[rc]) - float(r[ec])) > 1e-6:
+                        raise DatasetMixError(f"raw/effective action mismatch in {key}")
                 rows.append(r)
     man0 = telemetry.load_manifest(manifest_path_for(csv_paths[0]))
     fingerprint = {
@@ -103,7 +104,6 @@ def load_training_rows(csv_paths: Sequence[str], include_boss: bool = False,
         "experiment_config_version": man0.get("experiment_config_version"),
         "experiment_config_hash": man0.get("experiment_config_hash"),
         "manifest_extra": man0.get("extra") or {},
-        "include_boss": include_boss,
         "datasets": datasets,
         "dataset_id": hashlib.sha256(json.dumps(
             sorted(d["sha256"] for d in datasets)).encode()).hexdigest()[:16],
@@ -197,3 +197,59 @@ def heuristic_action_for_row(r: dict) -> List[float]:
     h = core.rule_based_dda(m, node_depth=int(float(r["node_depth"])),
                             hp_ratio=float(r["pre_hp_ratio"]))
     return [float(h[k]) for k in core.ACTION_KEYS]
+
+
+# ---------------------------------------------------------------------------
+# Loot-event features (Q_loot / G_loot). Every feature is known BEFORE the
+# horizon starts: the loot room's pre-reward condition, the equipment held
+# before the selection, and the selected category / item.
+# ---------------------------------------------------------------------------
+
+ITEM_INDEX = {iid: i for i, iid in enumerate(core.ALL_ITEM_IDS)}
+SLOT_INDEX = {s: i for i, s in enumerate(core.SLOTS)}
+LOOT_VARIANTS = {
+    "x": ("cond",),                              # state only
+    "xe": ("cond", "prior"),                     # state + prior equipment (no reward info)
+    "xc": ("cond", "cat"),                       # + selected category
+    "xcie": ("cond", "cat", "item", "prior"),    # + selected item and prior equipment
+}
+REWARD_AWARE = {"xc": "x", "xcie": "xe"}         # reward-aware variant -> its state-only twin
+
+
+def equip_onehot(equip: Dict[str, str]) -> List[float]:
+    v = [0.0] * len(ITEM_INDEX)
+    for s in core.SLOTS:
+        v[ITEM_INDEX[equip[s]]] = 1.0
+    return v
+
+
+def cat_onehot(cat: str) -> List[float]:
+    v = [0.0] * len(core.SLOTS)
+    v[SLOT_INDEX[cat]] = 1.0
+    return v
+
+
+def item_onehot(item_id: str) -> List[float]:
+    v = [0.0] * len(ITEM_INDEX)
+    v[ITEM_INDEX[item_id]] = 1.0
+    return v
+
+
+def loot_feature_dim(variant: str) -> int:
+    sizes = {"cond": core.COND_DIM, "prior": len(ITEM_INDEX), "cat": len(core.SLOTS),
+             "item": len(ITEM_INDEX)}
+    return sum(sizes[p] for p in LOOT_VARIANTS[variant])
+
+
+def loot_features(cond_s: List[float], equip_before: Dict[str, str], cat: Optional[str],
+                  item_id: Optional[str], variant: str) -> List[float]:
+    parts = {"cond": list(cond_s), "prior": equip_onehot(equip_before)}
+    if "cat" in LOOT_VARIANTS[variant]:
+        parts["cat"] = cat_onehot(cat)
+    if "item" in LOOT_VARIANTS[variant]:
+        parts["item"] = item_onehot(item_id)
+    return [v for p in LOOT_VARIANTS[variant] for v in parts[p]]
+
+
+def loot_row_equip_before(r: dict) -> Dict[str, str]:
+    return {s: r["equip_before_" + s] for s in core.SLOTS}

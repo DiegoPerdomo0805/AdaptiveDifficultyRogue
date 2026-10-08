@@ -27,6 +27,7 @@ def _edit_manifest(mpath, **kv):
 @pytest.mark.parametrize("field,value", [
     ("config_hash", "deadbeefdeadbeef"), ("schema_version", "room_samples_v2.1"),
     ("dda_version", "rule_based_dda_v1.1"), ("experiment_config_hash", "0000"),
+    ("schema_version", "room_samples_v3.0"),
     ("experiment_config_version", "old"), ("n_rows", 999999),
 ])
 def test_manifest_tampering_rejected(tmp_path, field, value):
@@ -46,8 +47,9 @@ def test_policy_extra_mismatch_rejected(tmp_path):
         telemetry.validate_dataset(csv_path, mpath, expected_extra_subset=extra)
 
 
-@pytest.mark.parametrize("col,value", [("controller_type", "oracle"), ("schema_version", "x"),
-                                       ("fallback_used", "2")])
+@pytest.mark.parametrize("col,value", [("controller_type", "oracle"), ("enemy_controller", "oracle"),
+                                       ("reward_policy", "oracle"), ("schema_version", "x"),
+                                       ("fallback_used", "2"), ("equip_weapon", "weapon.excalibur")])
 def test_bad_rows_rejected(tmp_path, col, value):
     csv_path, mpath = _copy(tmp_path)
     lines = open(csv_path).read().splitlines()

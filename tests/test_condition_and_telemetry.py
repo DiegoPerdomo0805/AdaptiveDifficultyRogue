@@ -80,14 +80,19 @@ def test_no_duplicate_keys_and_controller_identity(tmp_path):
     rows = _rows(make_dataset(tmp_path / "d.csv", runs=30, controller="exploration=0.5,fixed=0.5"))
     keys = [(r["run_id"], r["room_seq"]) for r in rows]
     assert len(keys) == len(set(keys))
-    assert all(r["controller_type"] in ("exploration", "fixed") for r in rows)
+    assert all(r["enemy_controller"] in ("exploration", "fixed") for r in rows)
+    for r in rows:
+        if r["room_kind"] == "boss":
+            assert r["controller_type"] == "shared_boss" and r["action_source"] == "shared_boss"
+        else:
+            assert r["controller_type"] == r["enemy_controller"]
     assert all(r["controller_version"] for r in rows)
     assert all(r["fallback_used"] == "0" and r["fallback_reason"] == "" for r in rows)
     assert all(r["player_profile"] and r["player_profile"] != "human" for r in rows)
     # one controller per run
     per_run = {}
     for r in rows:
-        per_run.setdefault(r["run_id"], set()).add(r["controller_type"])
+        per_run.setdefault(r["run_id"], set()).add(r["enemy_controller"])
     assert all(len(v) == 1 for v in per_run.values())
 
 
@@ -95,7 +100,10 @@ def test_effective_config_and_boss_semantics(tmp_path):
     rows = _rows(make_dataset(tmp_path / "d.csv", runs=40, controller="exploration"))
     boss = [r for r in rows if r["room_kind"] == "boss"]
     assert boss
+    import balance
+    sb = balance.load_experiment_config()["shared_boss"]["raw_action"]
     for r in boss:
+        assert float(r["applied_raw_hp_mult"]) == sb["enemy_hp_mult"]
         assert float(r["applied_hp_mult"]) == pytest.approx(round(float(r["applied_raw_hp_mult"]) * core.BOSS_HP_MULT, 3))
         assert int(r["applied_spawn_count"]) == core.BOSS_SPAWN_N
     for r in rows:

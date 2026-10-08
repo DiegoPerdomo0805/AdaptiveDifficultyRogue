@@ -34,10 +34,12 @@ import sys
 
 import balance
 
-CONTROLLER_ORDER = ["fixed", "heuristic", "exploration", "cgan"]
+CONTROLLER_ORDER = ["fixed", "heuristic", "exploration", "cgan",
+                    "fixed_uniform", "learned_loot"]
+LOOT_H = ["h_" + c for c in balance.LOOT_OUTCOME_COLUMNS]
 # Validated categorical slots (light surface), fixed per controller entity.
 CONTROLLER_COLORS = {"fixed": "#2a78d6", "heuristic": "#eb6834", "cgan": "#1baf7a",
-                     "exploration": "#eda100"}
+                     "exploration": "#eda100", "fixed_uniform": "#2a78d6", "learned_loot": "#1baf7a"}
 
 
 def load_rows(paths: List[str]) -> List[dict]:
@@ -48,10 +50,11 @@ def load_rows(paths: List[str]) -> List[dict]:
     return rows
 
 
-def group_runs(rows) -> Dict[str, Dict[str, List[dict]]]:
+def group_runs(rows, key: str = "enemy_controller") -> Dict[str, Dict[str, List[dict]]]:
+    """Runs grouped by experimental condition (enemy_controller or reward_policy)."""
     out: Dict[str, Dict[str, List[dict]]] = {}
     for r in rows:
-        out.setdefault(r["controller_type"], {}).setdefault(r["run_id"], []).append(r)
+        out.setdefault(r[key], {}).setdefault(r["run_id"], []).append(r)
     for runs in out.values():
         for rr in runs.values():
             rr.sort(key=lambda r: int(r["room_seq"]))
@@ -59,15 +62,28 @@ def group_runs(rows) -> Dict[str, Dict[str, List[dict]]]:
 
 
 def run_summary(rr: List[dict], cfg) -> dict:
-    combat = [r for r in rr if r["is_combat_room"] == "1" and r["room_kind"] != "boss"]
+    """Per-run aggregates. Ordinary-room metrics use ONLY room_kind == 'enemy'
+    (boss rooms are reported separately: shared deterministic boss policy)."""
+    import loot_dataset
+    combat = [r for r in rr if r["room_kind"] == "enemy"]
     ys = [balance.outcome_vector(r, cfg) for r in combat]
     died = any(r["died_in_room"] == "1" for r in rr)
-    boss = any(r["room_kind"] == "boss" for r in rr)
-    win = any(r["room_kind"] == "boss" and r["room_result"] == "cleared" for r in rr)
+    boss_rows = [r for r in rr if r["room_kind"] == "boss"]
+    boss = bool(boss_rows)
+    win = any(r["room_result"] == "cleared" for r in boss_rows)
     s = {"run_seed": rr[0]["run_seed"], "died": float(died), "boss_reached": float(boss),
          "victory": float(win), "combat_rooms": float(len(combat)),
          "final_progress": max(float(r["progress_norm"]) for r in rr),
+         "died_in_ordinary_room": float(any(r["died_in_room"] == "1" for r in combat)),
+         "boss_died": float(any(r["died_in_room"] == "1" for r in boss_rows)),
+         "boss_entry_hp": float(boss_rows[0]["pre_hp_ratio"]) if boss else 0.0,
+         "boss_post_hp": float(boss_rows[0]["post_hp_ratio"]) if boss else 0.0,
          "n": len(ys), "fallback_rows": sum(int(r["fallback_used"]) for r in rr)}
+    ev = [e for e in loot_dataset.derive_from_rows(rr, cfg)
+          if e["selected_category"] != "none" and e["horizon_combat_rooms"] >= 1]
+    s["n_loot"] = len(ev)
+    for c in LOOT_H + ["horizon_balance_distance", "terminated_early"]:
+        s["loot_sum_" + c] = sum(float(e[c]) for e in ev)
     for i, col in enumerate(balance.OUTCOME_COLUMNS):
         s["sum_" + col] = sum(y[i] for y in ys)
         s["intarget_" + col] = sum(1 for y in ys if balance.in_target(y, cfg)[i])
@@ -75,10 +91,13 @@ def run_summary(rr: List[dict], cfg) -> dict:
     return s
 
 
-RUN_METRICS = ["victory", "died", "boss_reached", "combat_rooms", "final_progress"]
+RUN_METRICS = ["victory", "died", "boss_reached", "combat_rooms", "final_progress",
+               "died_in_ordinary_room"]
+BOSS_METRICS = ["boss_survival", "boss_entry_hp", "boss_post_hp"]
 PAIRED_METRICS = ["run_victory", "run_died", "run_combat_rooms", "room_mean_balance_distance",
                   "room_mean_post_hp_ratio", "room_mean_death", "room_mean_damage_share",
-                  "room_mean_duration_norm"]
+                  "room_mean_duration_norm", "boss_survival", "loot_mean_horizon_balance_distance",
+                  "loot_mean_h_death_within", "loot_mean_h_end_hp_ratio"]
 
 
 def _metric_fns() -> Dict[str, Callable[[List[dict]], float]]:
@@ -92,6 +111,17 @@ def _metric_fns() -> Dict[str, Callable[[List[dict]], float]]:
         fns["room_mean_" + col] = ratio("sum_" + col)
         fns["room_in_target_" + col] = ratio("intarget_" + col)
     fns["room_mean_balance_distance"] = ratio("sum_balance")
+
+    def boss_ratio(num):
+        return lambda S: (sum(s[num] for s in S) / max(sum(s["boss_reached"] for s in S), 1))
+    fns["boss_survival"] = boss_ratio("victory")
+    fns["boss_entry_hp"] = boss_ratio("boss_entry_hp")
+    fns["boss_post_hp"] = boss_ratio("boss_post_hp")
+
+    def loot_ratio(num):
+        return lambda S: (sum(s[num] for s in S) / max(sum(s["n_loot"] for s in S), 1))
+    for c in LOOT_H + ["horizon_balance_distance", "terminated_early"]:
+        fns["loot_mean_" + c] = loot_ratio("loot_sum_" + c)
     return fns
 
 
@@ -105,7 +135,8 @@ def bootstrap_ci(S: List[dict], fn, b: int, seed: int):
 
 
 def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, seed: int = 0,
-            plots: bool = False, model_diagnostics: dict = None) -> dict:
+            plots: bool = False, model_diagnostics: dict = None, group_by: str = "enemy_controller",
+            extra_sections: dict = None) -> dict:
     cfg = balance.load_experiment_config()
     rows = load_rows(paths)
     human = [r for r in rows if r["player_profile"] == "human"]
@@ -115,7 +146,7 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
     if source == "human" and len(human) != len(rows):
         raise SystemExit("--source human requires only human rows")
     os.makedirs(out_dir, exist_ok=True)
-    by_ctrl = group_runs(rows)
+    by_ctrl = group_runs(rows, group_by)
     ctrls = [c for c in CONTROLLER_ORDER if c in by_ctrl] + sorted(set(by_ctrl) - set(CONTROLLER_ORDER))
     fns = _metric_fns()
 
@@ -123,7 +154,7 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
                "experiment_config_version": cfg["experiment_config_version"],
                "experiment_config_hash": balance.experiment_config_hash(cfg),
                "bootstrap": {"B": b, "seed": seed, "unit": "run"},
-               "controllers": {}, "death_by_depth": {}, "paired": {}}
+               "group_by": group_by, "controllers": {}, "death_by_depth": {}, "paired": {}}
     run_sums = {}
     for c in ctrls:
         S = [run_summary(rr, cfg) for rr in by_ctrl[c].values()]
@@ -134,7 +165,25 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
                  "metrics": {}, "action_source": {}, "fallback_reasons": {},
                  "fallback_rows": sum(int(r["fallback_used"]) for r in ctrl_rows),
                  "checkpoint_ids": sorted(set(r["model_checkpoint_id"] for r in ctrl_rows if r["model_checkpoint_id"])),
-                 "actions_at_bound_share": 0.0, "mean_action": {}}
+                 "actions_at_bound_share": 0.0, "mean_action": {},
+                 "enemy_controllers": sorted({r["enemy_controller"] for r in ctrl_rows}),
+                 "reward_policies": sorted({r["reward_policy"] for r in ctrl_rows}),
+                 "boss_rows_shared_policy": all(r["controller_type"] == "shared_boss"
+                                                for r in ctrl_rows if r["room_kind"] == "boss")}
+        loot_rows = [r for r in ctrl_rows if r["loot_event_id"]]
+        cats = {c: sum(1 for r in loot_rows if r["selected_category"] == c)
+                for c in ["weapon", "spell", "armor", "boots", "none"]}
+        probs = ([sum(float(r["reward_prob_" + c]) for r in loot_rows) / len(loot_rows)
+                  for c in ("weapon", "spell", "armor", "boots")] if loot_rows else [])
+        entry["loot"] = {"events": len(loot_rows), "selected_counts": cats,
+                         "mean_proposed_probs": probs,
+                         "proposal_entropy_nats": -sum(p * math.log(p) for p in probs if p > 0),
+                         "reward_fallback_events": sum(1 for r in loot_rows if r["reward_fallback_used"] == "1"),
+                         "reward_fallback_reasons": {}}
+        for r in loot_rows:
+            if r["reward_fallback_used"] == "1":
+                fr = entry["loot"]["reward_fallback_reasons"]
+                fr[r["reward_fallback_reason"]] = fr.get(r["reward_fallback_reason"], 0) + 1
         for name, fn in fns.items():
             est, lo, hi = bootstrap_ci(S, fn, b, seed)
             entry["metrics"][name] = {"estimate": est, "ci_low": lo, "ci_high": hi}
@@ -143,7 +192,7 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
         for r in ctrl_rows:
             if r["fallback_used"] == "1":
                 entry["fallback_reasons"][r["fallback_reason"]] = entry["fallback_reasons"].get(r["fallback_reason"], 0) + 1
-        nb = [r for r in combat if r["room_kind"] != "boss"]
+        nb = [r for r in combat if r["room_kind"] == "enemy"]
         if nb:
             import dda_core as core
             at_bound = 0
@@ -168,7 +217,8 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
         summary["death_by_depth"][c] = {d: {"rooms": v[0], "deaths": v[1], "rate": v[1] / v[0]}
                                         for d, v in sorted(depth.items())}
 
-    for base_name in ("heuristic", "fixed"):
+    baselines = ("heuristic", "fixed") if group_by == "enemy_controller" else ("heuristic", "fixed_uniform")
+    for base_name in baselines:
         if base_name not in run_sums:
             continue
         base = {s["run_seed"]: s for s in run_sums[base_name]}
@@ -190,10 +240,12 @@ def analyze(paths: List[str], out_dir: str, source: str = "bot", b: int = 1000, 
 
     if model_diagnostics:
         summary["model_diagnostics"] = model_diagnostics
+    for k, v in (extra_sections or {}).items():
+        summary[k] = v
 
     _write_tables(summary, ctrls, out_dir)
     if plots:
-        summary["plots"] = _plots(summary, ctrls, rows, cfg, out_dir)
+        summary["plots"] = _plots(summary, ctrls, rows, cfg, out_dir, group_by)
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=float)
     return summary
@@ -227,7 +279,7 @@ def _write_tables(summary, ctrls, out_dir):
                     if name != "n_pairs":
                         w.writerow([comp, c, name, m["diff"], m["ci_low"], m["ci_high"], res["n_pairs"]])
 
-    L = ["# Controller comparison", "",
+    L = [f"# Comparison by {summary['group_by']}", "",
          f"Experiment config `{summary['experiment_config_version']}` "
          f"(`{summary['experiment_config_hash']}`), source: {summary['source']}. "
          f"95% CIs: run-level bootstrap, B={summary['bootstrap']['B']}.", "",
@@ -239,12 +291,20 @@ def _write_tables(summary, ctrls, out_dir):
         L.append(f"| {c} | {e['n_runs']} | {e['n_rows']} | {e['n_combat_rooms']} | {e['fallback_rows']} | "
                  f"{100 * e['actions_at_bound_share']:.1f}% | "
                  + ", ".join(f"{k}: {v}" for k, v in sorted(e["action_source"].items())) + " |")
-    L += ["", "## Run outcomes", "", "| controller | victory | death | boss reached | combat rooms | final progress |",
-          "|---|---|---|---|---|---|"]
+    L += ["", "## End-to-end run outcomes", "",
+          "| condition | victory | death | boss reached | combat rooms | final progress | died in ordinary room |",
+          "|---|---|---|---|---|---|---|"]
     for c in ctrls:
         m = summary["controllers"][c]["metrics"]
         L.append(f"| {c} | " + " | ".join(_fmt(m["run_" + k]) for k in RUN_METRICS) + " |")
-    L += ["", "## Per-room observed outcomes (non-boss combat rooms)", "",
+    L += ["", "## Boss-only outcomes (shared deterministic boss policy for every condition)", "",
+          "| condition | boss survival (cleared / reached) | HP entering boss | HP after boss | boss rows shared_boss |",
+          "|---|---|---|---|---|"]
+    for c in ctrls:
+        m = summary["controllers"][c]["metrics"]
+        L.append(f"| {c} | " + " | ".join(_fmt(m[k]) for k in BOSS_METRICS)
+                 + f" | {summary['controllers'][c]['boss_rows_shared_policy']} |")
+    L += ["", "## Per-room observed outcomes (ordinary combat rooms only; boss rooms excluded)", "",
           "| controller | " + " | ".join(balance.OUTCOME_COLUMNS) + " | balance distance |",
           "|---" * (len(balance.OUTCOME_COLUMNS) + 2) + "|"]
     for c in ctrls:
@@ -257,6 +317,26 @@ def _write_tables(summary, ctrls, out_dir):
     for c in ctrls:
         m = summary["controllers"][c]["metrics"]
         L.append(f"| {c} | " + " | ".join(_fmt(m["room_in_target_" + k]) for k in balance.OUTCOME_COLUMNS) + " |")
+    L += ["", "## Loot: next-3-combat-room outcomes per selected reward (descriptive within a condition)", "",
+          "| condition | events | categories w/s/a/b/none | mean proposed probs | proposal entropy | reward fallbacks | "
+          "P(death within) | end HP | damage share | horizon balance distance | incomplete horizon |",
+          "|---" * 11 + "|"]
+    for c in ctrls:
+        e, m = summary["controllers"][c]["loot"], summary["controllers"][c]["metrics"]
+        L.append(f"| {c} | {e['events']} | " + "/".join(str(e["selected_counts"][k]) for k in
+                                                        ("weapon", "spell", "armor", "boots", "none"))
+                 + " | " + "/".join(f"{p:.2f}" for p in e["mean_proposed_probs"])
+                 + f" | {e['proposal_entropy_nats']:.3f} | {e['reward_fallback_events']} | "
+                 + " | ".join(_fmt(m["loot_mean_" + k]) for k in ("h_death_within", "h_end_hp_ratio",
+                                                                  "h_damage_share", "horizon_balance_distance",
+                                                                  "terminated_early")) + " |")
+    pvo = summary.get("predicted_vs_observed")
+    if pvo:
+        L += ["", f"## Predicted vs. observed ({pvo.get('model', '')})", "",
+              "| condition | quantity | predicted | observed |", "|---|---|---|---|"]
+        for c, d in pvo.get("by_condition", {}).items():
+            for q, v in d.items():
+                L.append(f"| {c} | {q} | {v['predicted']:.4f} | {v['observed']:.4f} |")
     for comp, per in summary["paired"].items():
         L += ["", f"## Paired differences {comp.replace('_', ' ')} (controller minus baseline, "
                   f"equivalent run seeds)", "",
@@ -277,17 +357,20 @@ def _write_tables(summary, ctrls, out_dir):
         L += ["", "## Generator diagnostics (fixed evaluation conditions)", "",
               "| metric | value |", "|---|---|"]
         for k in ("checkpoint_id", "n_conditions", "validity", "saturation", "diversity", "sensitivity",
-                  "jitter", "balance_pred"):
+                  "jitter", "balance_pred", "ood_rate", "support_ratio", "support_threshold",
+                  "entropy", "repeated_noise_diversity", "max_mean_prob"):
             if k in md:
                 v = md[k]
                 L.append(f"| {k} | {v:.4f} |" if isinstance(v, float) else f"| {k} | {v} |")
         for k, v in md.get("balance_ref", {}).items():
             L.append(f"| balance_pred_{k} | {v:.4f} |")
+        for k, v in md.get("ood_rate_ref", {}).items():
+            L.append(f"| ood_rate_{k} | {v:.4f} |")
     with open(os.path.join(out_dir, "summary.md"), "w") as f:
         f.write("\n".join(L) + "\n")
 
 
-def _plots(summary, ctrls, rows, cfg, out_dir) -> List[str]:
+def _plots(summary, ctrls, rows, cfg, out_dir, group_by="enemy_controller") -> List[str]:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -349,8 +432,7 @@ def _plots(summary, ctrls, rows, cfg, out_dir) -> List[str]:
     cols = ["applied_raw_hp_mult", "applied_raw_dmg_mult", "applied_raw_speed_mult", "applied_raw_spawn_count"]
     for ax, col in zip(axes, cols):
         for c in ctrls:
-            v = [float(r[col]) for r in rows if r["controller_type"] == c and r["is_combat_room"] == "1"
-                 and r["room_kind"] != "boss"]
+            v = [float(r[col]) for r in rows if r[group_by] == c and r["room_kind"] == "enemy"]
             ax.hist(v, bins=20, histtype="step", linewidth=2, color=CONTROLLER_COLORS.get(c, "#888"), label=c)
         ax.set_title(col.replace("applied_raw_", ""), loc="left")
     axes[0].legend(frameon=False, fontsize=8)
@@ -371,6 +453,8 @@ def main(argv=None):
     ap.add_argument("--bootstrap", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--plots", action="store_true")
+    ap.add_argument("--group-by", choices=["enemy_controller", "reward_policy"], default=None,
+                    help="default: eval_meta.json's axis, else enemy_controller")
     args = ap.parse_args(argv)
     paths = list(args.csv)
     diag = None
@@ -383,7 +467,16 @@ def main(argv=None):
     if not paths:
         ap.error("no input CSVs (use --eval-dir or --csv)")
     out_dir = args.out_dir or args.eval_dir or "results"
-    s = analyze(paths, out_dir, args.source, args.bootstrap, args.seed, args.plots, diag)
+    group_by, extra = args.group_by, {}
+    if args.eval_dir and os.path.exists(os.path.join(args.eval_dir, "eval_meta.json")):
+        with open(os.path.join(args.eval_dir, "eval_meta.json")) as f:
+            meta = json.load(f)
+        group_by = group_by or meta.get("group_by")
+        for k in ("predicted_vs_observed",):
+            if k in meta:
+                extra[k] = meta[k]
+    s = analyze(paths, out_dir, args.source, args.bootstrap, args.seed, args.plots, diag,
+                group_by or "enemy_controller", extra)
     with open(os.path.join(out_dir, "summary.md")) as f:
         print(f.read())
     print("plots:", s.get("plots", "not requested"))

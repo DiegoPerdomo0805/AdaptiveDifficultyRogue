@@ -13,11 +13,23 @@ trainer, which minimized BCE_adv + 0.5 * MSE(G(x), heuristic applied_*)).
 
   L_D = BCE(D(x, a_obs), 1) + BCE(D(x, G(x, z)), 0)
   L_G = L_adv + lambda_balance * L_balance + lambda_diversity * L_diversity
+        + lambda_support * L_support
     L_adv       = BCE(D(x, G(x, z1)), 1)                (stay in the observed
                                                           safe action support)
     L_balance   = balance.balance_loss_torch(Q(x, G(x, z1)))   (targets from
                                                           experiment_config.json)
     L_diversity = mean(relu(tau - |G(x,z1)-G(x,z2)|_1 / |z1-z2|_1))
+    L_support   = mean(relu(d_kNN(x, G(x,z1)) / threshold - 1)^2)   (OOD guard)
+
+Action-support / OOD protection (experiment_config.enemy_action_support):
+  * G's outputs are confined by construction to the per-dimension
+    [q_low, q_high] quantile box of OBSERVED training actions;
+  * L_support penalizes (x, a) pairs farther from the observed training
+    pairs than the threshold quantile of their own kNN distances, so G
+    cannot exploit Q's extrapolation in unobserved regions;
+  * the support reference set and threshold are saved in the checkpoint and
+    model_runtime.py rejects runtime actions beyond runtime_ood_factor x
+    threshold (logged heuristic fallback, reason ood_action).
 
 The observed actions a_obs (from fixed, heuristic AND exploration rows)
 only enter the discriminator as samples of the plausible action support.
@@ -45,7 +57,7 @@ import dda_core as core
 import ml_data
 import telemetry
 
-CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v3"
+CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v4"
 COND_COLUMNS = ml_data.COND_COLUMNS
 ACTION_COLUMNS = ml_data.ACTION_COLUMNS
 
@@ -78,9 +90,13 @@ def main(argv=None):
     ap.add_argument("--lr-d", type=float, default=5e-4)
     ap.add_argument("--noise-dim", type=int, default=8)
     ap.add_argument("--hidden", type=int, default=128)
-    ap.add_argument("--lambda-balance", type=float, default=1.0)
-    ap.add_argument("--lambda-diversity", type=float, default=1.0)
+    ap.add_argument("--lambda-balance", type=float, default=None,
+                    help="default: experiment_config.cgan_training.lambda_balance")
+    ap.add_argument("--lambda-diversity", type=float, default=None,
+                    help="default: experiment_config.cgan_training.lambda_diversity")
     ap.add_argument("--diversity-tau", type=float, default=0.05)
+    ap.add_argument("--lambda-support", type=float, default=None,
+                    help="default: experiment_config.enemy_action_support.lambda_support")
     ap.add_argument("--patience", type=int, default=40, help="epochs without a better selection score")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cpu", help="cpu | cuda | auto")
@@ -103,6 +119,10 @@ def main(argv=None):
     t0 = time.time()
     cfg = balance.load_experiment_config()
     sel_cfg = cfg["cgan_selection"]
+    if args.lambda_balance is None:
+        args.lambda_balance = cfg["cgan_training"]["lambda_balance"]
+    if args.lambda_diversity is None:
+        args.lambda_diversity = cfg["cgan_training"]["lambda_diversity"]
 
     # --- Q (frozen) and its data contract --------------------------------
     qck = torch.load(os.path.join(args.q_dir, "q_checkpoint.pt"), map_location=device, weights_only=True)
@@ -119,8 +139,7 @@ def main(argv=None):
         if qck[key] != cur:
             raise SystemExit(f"Q checkpoint {key}={qck[key]!r} != current {cur!r}; retrain Q.")
 
-    rows, fp = ml_data.load_training_rows(args.csv, include_boss=qck["dataset_fingerprint"]["include_boss"],
-                                          expected_extra_subset=bot_runner.policy_extra())
+    rows, fp = ml_data.load_training_rows(args.csv, expected_extra_subset=bot_runner.policy_extra())
     if fp["dataset_id"] != qck["dataset_fingerprint"]["dataset_id"]:
         raise SystemExit(f"dataset {fp['dataset_id']} differs from Q's training dataset "
                          f"{qck['dataset_fingerprint']['dataset_id']}; pass the same --csv files.")
@@ -130,25 +149,33 @@ def main(argv=None):
 
     cond_scaler = ml_data.Standardizer.from_json(qck["cond_scaler"])
     out_scaler_json = qck["outcome_scaler"]
-    out_scaler_t = models.OutcomeScaler(out_scaler_json["mean"], out_scaler_json["std"]).to(device)
     q = models.OutcomeModel(**qck["q_xa_hparams"]).to(device)
     q.load_state_dict(qck["q_xa_state"])
     models.freeze(q)
 
     x_tr = torch.tensor(cond_scaler.transform(ml_data.cond_matrix(tr_rows)), dtype=torch.float32, device=device)
     a_tr = _actions_n(ml_data.action_matrix(tr_rows), torch, device)
+
+    sup_cfg = cfg["enemy_action_support"]
+    lambda_support = sup_cfg["lambda_support"] if args.lambda_support is None else args.lambda_support
+    support = models.SupportModel.fit(x_tr, a_tr, sup_cfg["knn_k"], sup_cfg["knn_threshold_quantile"],
+                                      sup_cfg["reference_max_rows"], seed=args.seed)
+    box_lo, box_hi = models.support_box(a_tr, *sup_cfg["box_quantiles"])
+    print(f"action-support box (normalized) lo {[round(v, 3) for v in box_lo.tolist()]} "
+          f"hi {[round(v, 3) for v in box_hi.tolist()]}; kNN threshold {support.threshold:.4f}")
     x_va = torch.tensor(cond_scaler.transform(ml_data.cond_matrix(va_rows)), dtype=torch.float32, device=device)
     refs = {
         "observed": _actions_n(ml_data.action_matrix(va_rows), torch, device),
         "heuristic": _actions_n([ml_data.heuristic_action_for_row(r) for r in va_rows], torch, device),
-        "fixed": _actions_n([[cfg["controllers"]["fixed"]["action"][k] for k in core.ACTION_KEYS]]
+        "fixed": _actions_n([[cfg["enemy_controller"]["fixed"]["action"][k] for k in core.ACTION_KEYS]]
                             * len(va_rows), torch, device),
     }
     # Dequantize the integer spawn dimension of real actions so D cannot
     # separate real/fake merely by integrality.
     spawn_half_bin = 0.5 / (ml_data.ACTION_HI[-1] - ml_data.ACTION_LO[-1])
 
-    gen = models.Generator(noise_dim=args.noise_dim, hidden=args.hidden).to(device)
+    gen = models.Generator(noise_dim=args.noise_dim, hidden=args.hidden,
+                           box_lo=box_lo.tolist(), box_hi=box_hi.tolist()).to(device)
     disc = models.Discriminator(hidden=args.hidden).to(device)
     opt_g = torch.optim.Adam(gen.parameters(), lr=args.lr_g, betas=(0.5, 0.999))
     opt_d = torch.optim.Adam(disc.parameters(), lr=args.lr_d, betas=(0.5, 0.999))
@@ -161,7 +188,7 @@ def main(argv=None):
         gen.train()
         disc.train()
         perm = torch.randperm(n, device=device)
-        sums = {"d": 0.0, "g": 0.0, "adv": 0.0, "balance": 0.0, "diversity": 0.0}
+        sums = {"d": 0.0, "g": 0.0, **{k: 0.0 for k in models.GENERATOR_LOSS_TERMS}}
         nb = 0
         for s in range(0, n, args.batch_size):
             idx = perm[s:s + args.batch_size]
@@ -177,8 +204,8 @@ def main(argv=None):
             d_loss.backward()
             opt_d.step()
 
-            terms = models.generator_loss(gen, disc, q, out_scaler_t, x_b, args.lambda_balance,
-                                          args.lambda_diversity, args.diversity_tau, cfg)
+            terms = models.generator_loss(gen, disc, q, support, x_b, args.lambda_balance,
+                                          args.lambda_diversity, args.diversity_tau, lambda_support, cfg)
             opt_g.zero_grad()
             terms["total"].backward()
             opt_g.step()
@@ -189,31 +216,36 @@ def main(argv=None):
                 sums[k] += terms[k].item()
             nb += 1
 
-        diag = models.generator_diagnostics(gen, q, out_scaler_t, x_va, run_index=va_runs,
+        diag = models.generator_diagnostics(gen, q, support, x_va, run_index=va_runs,
                                             reference_actions_n=refs, k=sel_cfg["diversity_samples"],
                                             seed=args.seed, exp_cfg=cfg)
         score = models.selection_score(diag, sel_cfg)
         rec = {"epoch": epoch, **{f"loss_{k}": v / max(nb, 1) for k, v in sums.items()},
                "val_score": score, **{f"val_{k}": v for k, v in diag.items()
                                       if not isinstance(v, dict)},
-               "val_balance_ref": diag["balance_ref"]}
+               "val_balance_ref": diag["balance_ref"], "val_ood_rate_ref": diag["ood_rate_ref"]}
         history.append(rec)
-        if score < best["score"] - 1e-6:
+        eligible = models.selection_eligible(diag, epoch, sel_cfg)
+        rec["eligible"] = eligible
+        if eligible and score < best["score"] - 1e-6:
             best = {"score": score, "epoch": epoch, "diag": diag,
                     "gen": copy.deepcopy(gen.state_dict()), "disc": copy.deepcopy(disc.state_dict()),
                     "opt_g": copy.deepcopy(opt_g.state_dict()), "opt_d": copy.deepcopy(opt_d.state_dict())}
             bad = 0
-        else:
+        elif epoch >= sel_cfg.get("min_epoch", 0):
             bad += 1
         if epoch % 10 == 0 or epoch == args.epochs - 1:
             print(f"epoch {epoch:4d} D {rec['loss_d']:.3f} adv {rec['loss_adv']:.3f} "
                   f"bal {rec['loss_balance']:.4f} div {rec['loss_diversity']:.4f} | val score {score:.4f} "
                   f"bal_pred {diag['balance_pred']:.4f} (heur {diag['balance_ref']['heuristic']:.4f}) "
-                  f"div {diag['diversity']:.3f} sens {diag['sensitivity']:.3f}")
+                  f"div {diag['diversity']:.3f} sens {diag['sensitivity']:.3f} ood {diag['ood_rate']:.3f}")
         if bad >= args.patience:
             print(f"early stop at epoch {epoch} (best {best['epoch']})")
             break
 
+    if best["epoch"] < 0:
+        raise SystemExit("no eligible checkpoint: every epoch was before min_epoch or had trivial "
+                         "diversity/sensitivity (see cgan_selection in experiment_config.json)")
     gen.load_state_dict(best["gen"])
     ckpt_id = checkpoint_id_for(best["gen"], torch)
     ckpt = {
@@ -233,13 +265,17 @@ def main(argv=None):
         "cond_scaler": cond_scaler.to_json(), "outcome_scaler": out_scaler_json,
         "generator_hparams": gen.hparams, "discriminator_hparams": disc.hparams,
         "q_hparams": qck["q_xa_hparams"],
+        "support_state": support.to_state(), "support_config": sup_cfg,
+        "action_support_box": {"lo": box_lo.tolist(), "hi": box_hi.tolist()},
+        "lambda_support": lambda_support,
         "generator_state_dict": best["gen"], "discriminator_state_dict": best["disc"],
         "q_state_dict": qck["q_xa_state"],
         "optimizer_g_state": best["opt_g"], "optimizer_d_state": best["opt_d"],
         "epoch": best["epoch"], "best_score": best["score"], "best_diagnostics": best["diag"],
         "seed": args.seed, "hparams": vars(args), "split": split,
         "q_gate": gate, "q_gate_overridden": (not gate["passed"]) and args.allow_failed_q_gate,
-        "loss_equation": "L_G = L_adv + lambda_balance*L_balance + lambda_diversity*L_diversity",
+        "loss_equation": ("L_G = L_adv + lambda_balance*L_balance + lambda_diversity*L_diversity"
+                          " + lambda_support*L_support"),
         "history": history,
     }
     torch.save(ckpt, ckpt_path)
@@ -259,6 +295,8 @@ def main(argv=None):
     print(f"best epoch {best['epoch']} score {best['score']:.4f} checkpoint_id {ckpt_id}")
     print(f"  validity {d['validity']:.3f} saturation {d['saturation']:.3f} diversity {d['diversity']:.4f} "
           f"sensitivity {d['sensitivity']:.4f} jitter {d['jitter']:.4f}")
+    print(f"  OOD rate G {d['ood_rate']:.3f} (support ratio {d['support_ratio']:.3f}) | "
+          + " ".join(f"{k} {v:.3f}" for k, v in d["ood_rate_ref"].items()))
     print(f"  Q-predicted balance: G {d['balance_pred']:.4f} | "
           + " ".join(f"{k} {v:.4f}" for k, v in d["balance_ref"].items()))
     print(f"checkpoint -> {ckpt_path}")

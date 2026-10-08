@@ -18,7 +18,7 @@ def test_exploration_is_deterministic_and_worker_independent(tmp_path):
 
 def test_exploration_bounds_variation_and_branches(tmp_path):
     with open(make_dataset(tmp_path / "e.csv", runs=150, controller="exploration"), newline="") as f:
-        rows = [r for r in csv.DictReader(f) if r["is_combat_room"] == "1"]
+        rows = [r for r in csv.DictReader(f) if r["room_kind"] == "enemy"]
     cols = ["applied_raw_hp_mult", "applied_raw_dmg_mult", "applied_raw_speed_mult", "applied_raw_spawn_count"]
     for k, c in zip(core.ACTION_KEYS, cols):
         lo, hi = core.ACTION_BOUNDS[k]

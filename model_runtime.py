@@ -38,7 +38,7 @@ import dda_core as core
 import ml_data
 import telemetry
 
-CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v3"
+CHECKPOINT_SCHEMA_VERSION = "cgan_outcome_v4"
 CHECKPOINT_FILE = "cgan_checkpoint.pt"
 
 
@@ -48,6 +48,10 @@ class ModelVersionError(Exception):
 
 class InvalidModelOutput(ValueError):
     pass
+
+
+class OODAction(InvalidModelOutput):
+    """Generated action lies outside the observed (x, a) training support."""
 
 
 def verify_checkpoint(ck: dict, exp_cfg: Optional[dict] = None):
@@ -86,18 +90,21 @@ def verify_checkpoint(ck: dict, exp_cfg: Optional[dict] = None):
         ml_data.Standardizer.from_json(ck["outcome_scaler"]).check(balance.OUTCOME_COLUMNS[1:])
     except (KeyError, TypeError, ValueError) as e:
         raise ModelVersionError(f"invalid scaler in checkpoint: {e}")
-    for key in ("generator_state_dict", "generator_hparams", "checkpoint_id"):
+    for key in ("generator_state_dict", "generator_hparams", "checkpoint_id", "support_state",
+                "action_support_box"):
         if key not in ck:
             raise ModelVersionError(f"checkpoint is missing {key!r}")
 
 
 class LoadedModels:
-    def __init__(self, generator, cond_scaler, checkpoint: dict, q=None, out_scaler=None):
+    def __init__(self, generator, cond_scaler, checkpoint: dict, q=None, support=None,
+                 ood_factor: float = 1.5):
         self.generator = generator
         self.cond_scaler = cond_scaler
         self.checkpoint = checkpoint
         self.q = q
-        self.out_scaler = out_scaler
+        self.support = support
+        self.ood_factor = float(ood_factor)
         self.noise_dim = generator.noise_dim
         self.checkpoint_id = checkpoint["checkpoint_id"]
 
@@ -115,13 +122,14 @@ class LoadedModels:
         gen = models.Generator(**ck["generator_hparams"])
         gen.load_state_dict(ck["generator_state_dict"])
         gen.eval()
-        q = out_scaler = None
+        q = None
         if load_q:
             q = models.OutcomeModel(**ck["q_hparams"])
             q.load_state_dict(ck["q_state_dict"])
             models.freeze(q)
-            out_scaler = models.OutcomeScaler(ck["outcome_scaler"]["mean"], ck["outcome_scaler"]["std"])
-        return LoadedModels(gen, ml_data.Standardizer.from_json(ck["cond_scaler"]), ck, q, out_scaler)
+        support = models.SupportModel.from_state(ck["support_state"])
+        factor = balance.load_experiment_config()["enemy_action_support"]["runtime_ood_factor"]
+        return LoadedModels(gen, ml_data.Standardizer.from_json(ck["cond_scaler"]), ck, q, support, factor)
 
     def predict(self, cond_vec: List[float], noise: Optional[List[float]] = None) -> dict:
         """One bounded, finite action for one condition vector. Raises
@@ -140,7 +148,9 @@ class LoadedModels:
                 raise ModelVersionError(f"noise has {len(noise)} dims, expected {self.noise_dim}")
             z = torch.tensor([noise], dtype=torch.float32)
         with torch.no_grad():
-            a_n = self.generator(x, z)[0].tolist()
+            a_t = self.generator(x, z)
+            ratio = float(self.support.distance(x, a_t)[0]) / self.support.threshold
+        a_n = a_t[0].tolist()
         raw = ml_data.denormalize_action(a_n)
         if not all(math.isfinite(v) for v in raw):
             raise InvalidModelOutput(f"non-finite generator output {raw}")
@@ -148,4 +158,118 @@ class LoadedModels:
             lo, hi = core.ACTION_BOUNDS[k]
             if not (lo - 1e-6 <= raw[i] <= hi + 1e-6):
                 raise InvalidModelOutput(f"{k}={raw[i]} outside design bounds [{lo}, {hi}]")
-        return core.finalize_action(dict(zip(core.ACTION_KEYS, raw)))
+        if not math.isfinite(ratio) or ratio > self.ood_factor:
+            raise OODAction(f"support_ratio={ratio:.3f} > {self.ood_factor}")
+        out = core.finalize_action(dict(zip(core.ACTION_KEYS, raw)))
+        out["_support_distance"] = ratio      # distance / training threshold (logged)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Loot models
+# ---------------------------------------------------------------------------
+
+LOOT_POLICY_SCHEMA_VERSION = "loot_policy_v1"
+LOOT_POLICY_FILE = "loot_policy_checkpoint.pt"
+Q_LOOT_FILE = "q_loot_checkpoint.pt"
+
+
+def _verify_loot_common(ck: dict, exp_cfg: dict, label: str):
+    def need(key, expected):
+        if ck.get(key) != expected:
+            raise ModelVersionError(f"{label} {key}={ck.get(key)!r} does not match the current {expected!r}")
+    need("schema_version", telemetry.SCHEMA_VERSION)
+    need("experiment_config_version", exp_cfg["experiment_config_version"])
+    need("experiment_config_hash", balance.experiment_config_hash(exp_cfg))
+    need("outcome_columns", balance.LOOT_OUTCOME_COLUMNS)
+    need("cond_columns", ml_data.COND_COLUMNS)
+    need("item_ids", core.ALL_ITEM_IDS)
+    need("slots", core.SLOTS)
+    try:
+        ml_data.Standardizer.from_json(ck["cond_scaler"]).check(ml_data.COND_COLUMNS)
+    except (KeyError, TypeError, ValueError) as e:
+        raise ModelVersionError(f"invalid {label} scaler: {e}")
+
+
+class QLootPredictor:
+    """Frozen Q_loot variant for predicted-vs-observed delayed utility."""
+
+    def __init__(self, ck: dict, variant: str):
+        import models
+        self.ck = ck
+        self.variant = variant
+        self.net = models.BoundedOutcomeNet(**ck["variant_hparams"][variant])
+        self.net.load_state_dict(ck["variant_states"][variant])
+        models.freeze(self.net)
+        self.cond_scaler = ml_data.Standardizer.from_json(ck["cond_scaler"])
+
+    @staticmethod
+    def load(q_loot_dir: str, variant: Optional[str] = None) -> "QLootPredictor":
+        import torch
+        ck = torch.load(os.path.join(q_loot_dir, Q_LOOT_FILE), map_location="cpu", weights_only=True)
+        if ck.get("checkpoint_schema") != "q_loot_v1":
+            raise ModelVersionError(f"unexpected Q_loot checkpoint schema {ck.get('checkpoint_schema')!r}")
+        _verify_loot_common(ck, balance.load_experiment_config(), "Q_loot checkpoint")
+        variant = variant or ck["gate"].get("chosen_variant") or "xcie"
+        return QLootPredictor(ck, variant)
+
+    def predict_rows(self, rows: List[dict]) -> List[List[float]]:
+        """Physical predictions [P(death_within), end_hp, ...] for loot-dataset rows."""
+        import torch
+        import models
+        cond = self.cond_scaler.transform([[float(r[c]) for c in ml_data.COND_COLUMNS] for r in rows])
+        feats = [ml_data.loot_features(cs, ml_data.loot_row_equip_before(r), r["selected_category"],
+                                       r["selected_item_id"], self.variant) for cs, r in zip(cond, rows)]
+        with torch.no_grad():
+            return models.outcomes_physical(self.net(torch.tensor(feats, dtype=torch.float32))).tolist()
+
+
+class LoadedLootModel:
+    """G_loot for the learned_loot reward policy (only exists if the gate passed)."""
+
+    def __init__(self, gen, cond_scaler, checkpoint: dict):
+        self.generator = gen
+        self.cond_scaler = cond_scaler
+        self.checkpoint = checkpoint
+        self.noise_dim = gen.noise_dim
+        self.checkpoint_id = checkpoint["checkpoint_id"]
+
+    @staticmethod
+    def load(model_dir: str) -> "LoadedLootModel":
+        import torch
+        import models
+        path = os.path.join(model_dir, LOOT_POLICY_FILE)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No learned-loot checkpoint at {path}")
+        ck = torch.load(path, map_location="cpu", weights_only=True)
+        if ck.get("checkpoint_schema_version") != LOOT_POLICY_SCHEMA_VERSION:
+            raise ModelVersionError(f"loot checkpoint schema {ck.get('checkpoint_schema_version')!r} != "
+                                    f"{LOOT_POLICY_SCHEMA_VERSION!r}")
+        exp_cfg = balance.load_experiment_config()
+        _verify_loot_common(ck, exp_cfg, "loot checkpoint")
+        if not ck.get("q_loot_gate", {}).get("passed"):
+            raise ModelVersionError("loot checkpoint was not produced under a passed Q_loot gate")
+        recomputed = core.config_hash(extra=ck.get("dataset_extra") or {})
+        if ck.get("config_hash") != recomputed:
+            raise ModelVersionError("loot checkpoint config_hash does not match the current constants")
+        gen = models.LootGenerator(**ck["generator_hparams"])
+        gen.load_state_dict(ck["generator_state_dict"])
+        gen.eval()
+        return LoadedLootModel(gen, ml_data.Standardizer.from_json(ck["cond_scaler"]), ck)
+
+    def predict(self, cond_vec: List[float], equipment: dict, noise: Optional[List[float]] = None) -> List[float]:
+        import torch
+        if len(cond_vec) != core.COND_DIM or not all(math.isfinite(float(v)) for v in cond_vec):
+            raise ModelVersionError("invalid condition vector for the loot model")
+        cs = self.cond_scaler.transform([list(map(float, cond_vec))])[0]
+        feats = torch.tensor([list(cs) + ml_data.equip_onehot(equipment)], dtype=torch.float32)
+        z = None
+        if noise is not None:
+            if len(noise) != self.noise_dim:
+                raise ModelVersionError(f"noise has {len(noise)} dims, expected {self.noise_dim}")
+            z = torch.tensor([noise], dtype=torch.float32)
+        with torch.no_grad():
+            p = self.generator(feats, z)[0].tolist()
+        if not all(math.isfinite(v) and v >= -1e-9 for v in p) or abs(sum(p) - 1.0) > 1e-4:
+            raise InvalidModelOutput(f"invalid category probabilities {p}")
+        return [max(v, 0.0) for v in p]
