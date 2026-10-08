@@ -72,6 +72,15 @@ def record() -> dict:
     c = current_contract()
     if not c["experiment_config_status"].startswith("FROZEN"):
         raise SystemExit("experiment_config.json status is not FROZEN")
+    if os.path.exists(FREEZE_FILE):
+        # Superseded freezes are kept as historical evidence, never deleted.
+        with open(FREEZE_FILE) as f:
+            old = json.load(f)
+        if old.get("experiment_config_version") != c["experiment_config_version"]:
+            hist = os.path.join(_THIS_DIR, "freeze_history")
+            os.makedirs(hist, exist_ok=True)
+            with open(os.path.join(hist, f"experiment_freeze_{old['experiment_config_version']}.json"), "w") as f:
+                json.dump(old, f, indent=2)
     rec = {"frozen_commit": _git("rev-parse", "HEAD"),
            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "contract_files": CONTRACT_FILES, **c}
