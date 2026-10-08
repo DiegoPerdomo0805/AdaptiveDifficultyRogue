@@ -298,6 +298,17 @@ collection; it is trained afterwards only if the predefined Q_loot gate passes o
 
 ## Known limitations
 
+* **Known diagnostic warning: `fixed_default` "run outcomes collapsed".**
+  - **What fires:** `dataset_tools.py stats` raises this stop flag on the **fixed_default evaluation
+    dataset**, because the intentionally static and very easy baseline (multipliers 1.0, spawn 2)
+    wins about 98.5% of runs.
+  - **Status:** confirmed **non-blocking** for exp_v3.2. It describes the predeclared, untuned
+    baseline, not a pipeline failure.
+  - **Scope:** it affects only fixed_default-only datasets. The mixed principal-training collection
+    (enemy `exploration=0.65,heuristic=0.20,fixed=0.15`) does not trigger it: its smoke pilot had a
+    78.2% victory rate and raised no stop flags.
+  - **Collection stop flags stay binding:** `02_collect.sh` applies them to mixed seed blocks only.
+
 * Bot combat is an abstract resolver. Results describe the bot environment; human sessions are
   analyzed separately.
 * The bot's dash is an avoidance approximation (it has no positions); the human game applies the
