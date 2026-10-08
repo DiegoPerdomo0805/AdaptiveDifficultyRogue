@@ -1,6 +1,6 @@
 {
-  "experiment_config_version": "exp_v3.0",
-  "status": "PILOT: all balance targets are provisional. Run the Stage A calibration (python balance.py calibrate ...), review the proposed intervals, then set status to FROZEN and bump experiment_config_version before the principal collection.",
+  "experiment_config_version": "exp_v3.1",
+  "status": "FROZEN: design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric, fixed_default, shared boss, collection mixtures, gates, split seeds, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). Do not modify after collection starts.",
 
   "enemy_controller": {
     "fixed": {
