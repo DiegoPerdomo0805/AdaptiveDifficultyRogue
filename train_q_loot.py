@@ -123,7 +123,7 @@ def prediction_ranges(net, variant, rows, cond_scaler, torch, models, n_states=6
                     feats.append(ml_data.loot_features(cs, eq, cat, it.item_id, variant))
     net.eval()
     with torch.no_grad():
-        y = models.outcomes_physical(net(torch.tensor(feats, dtype=torch.float32)))
+        y = models.outcomes_physical(net(torch.tensor(feats, dtype=torch.float32, device=next(net.parameters()).device)))
     rngs = balance.output_ranges("loot")
     return {c: {"min": float(y[:, j].min()), "max": float(y[:, j].max()), "physical_range": list(rngs[j]),
                 "inside_physical_range": bool(y[:, j].min() >= rngs[j][0] - 1e-6 and y[:, j].max() <= rngs[j][1] + 1e-6)}
