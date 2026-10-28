@@ -1,0 +1,8 @@
+{
+  "plan_sha256": "1665b6dbc7cf558942a1c8ab4f6e64c37b327921056eaef3e3c00fc9a0ddb167",
+  "candidate": "closest_ood",
+  "checkpoint_id": "273ce5c8f782dcdf",
+  "alpha": 0.5,
+  "validation_score": 0.31065683771675623,
+  "validation_sha256": "0a7903b7a95ed1f5e3a709812ae2e66ffeccf977bfde4c9e5c183f4c46e5a1cd"
+}

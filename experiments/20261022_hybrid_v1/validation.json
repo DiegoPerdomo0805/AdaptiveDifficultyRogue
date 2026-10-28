@@ -1,0 +1,272 @@
+[
+  {
+    "candidate": "best_balance",
+    "checkpoint_id": "3f253bdb6389241f",
+    "alpha": 0.25,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 805,
+      "mean_B_r": 0.15624682775152687,
+      "cvar_B_r": 0.4278298521737929,
+      "selection_score": 0.3701617538384233,
+      "ordinary_room_death_rate": 0.04472049689440994,
+      "victory_rate": 0.72,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.008695652173913044,
+      "heuristic_same_state_ood_rate": 0.008695652173913044,
+      "ood_excess": 0.0,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.03210763818743375,
+          "observed_mean": 0.030012210012210012,
+          "bias": 0.0020954281752237395,
+          "mae": 0.026931448643985365,
+          "pearson_r": 0.5748266406002436
+        },
+        "B_r": {
+          "predicted_mean": 0.11421277149130689,
+          "observed_mean": 0.15624682775152687,
+          "bias": -0.04203405626021998,
+          "mae": 0.1072135573056451,
+          "pearson_r": 0.11705329681902797
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.05441270076802799,
+      "sensitivity": 0.016461269102162786,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  },
+  {
+    "candidate": "best_balance",
+    "checkpoint_id": "3f253bdb6389241f",
+    "alpha": 0.5,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 809,
+      "mean_B_r": 0.12541958117604848,
+      "cvar_B_r": 0.3903832660745268,
+      "selection_score": 0.32061121421331185,
+      "ordinary_room_death_rate": 0.03955500618046971,
+      "victory_rate": 0.735,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.006180469715698393,
+      "heuristic_same_state_ood_rate": 0.00865265760197775,
+      "ood_excess": -0.002472187886279357,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.02792572872298931,
+          "observed_mean": 0.026349206349206348,
+          "bias": 0.0015765223737829637,
+          "mae": 0.0269645075442587,
+          "pearson_r": 0.5494968546120919
+        },
+        "B_r": {
+          "predicted_mean": 0.06424808569084128,
+          "observed_mean": 0.12541958117604848,
+          "bias": -0.06117149548520721,
+          "mae": 0.0940884015816425,
+          "pearson_r": 0.22380377889309946
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.10743672187839236,
+      "sensitivity": 0.031739572890930705,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  },
+  {
+    "candidate": "best_balance",
+    "checkpoint_id": "3f253bdb6389241f",
+    "alpha": 0.75,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 817,
+      "mean_B_r": 0.10632502975218214,
+      "cvar_B_r": 0.42434658015140203,
+      "selection_score": 0.3184983198278831,
+      "ordinary_room_death_rate": 0.03182374541003672,
+      "victory_rate": 0.75,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.0587515299877601,
+      "heuristic_same_state_ood_rate": 0.03671970624235006,
+      "ood_excess": 0.022031823745410038,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.017864885349896158,
+          "observed_mean": 0.022836792836792838,
+          "bias": -0.004971907486896679,
+          "mae": 0.02923158350483824,
+          "pearson_r": 0.30376148474852016
+        },
+        "B_r": {
+          "predicted_mean": 0.022606100794447064,
+          "observed_mean": 0.10632502975218214,
+          "bias": -0.08371892895773506,
+          "mae": 0.09211356412741833,
+          "pearson_r": 0.22764809259479057
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.15815447377307074,
+      "sensitivity": 0.049015004808704056,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  },
+  {
+    "candidate": "closest_ood",
+    "checkpoint_id": "273ce5c8f782dcdf",
+    "alpha": 0.25,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 810,
+      "mean_B_r": 0.15188321246209427,
+      "cvar_B_r": 0.40368861587806953,
+      "selection_score": 0.35372752040112904,
+      "ordinary_room_death_rate": 0.04814814814814815,
+      "victory_rate": 0.69,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.008641975308641974,
+      "heuristic_same_state_ood_rate": 0.012345679012345678,
+      "ood_excess": -0.003703703703703704,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.03240437458484445,
+          "observed_mean": 0.03136955636955637,
+          "bias": 0.0010348182152880789,
+          "mae": 0.028170074858012997,
+          "pearson_r": 0.5386599965465156
+        },
+        "B_r": {
+          "predicted_mean": 0.10922335864471636,
+          "observed_mean": 0.15188321246209427,
+          "bias": -0.04265985381737791,
+          "mae": 0.10353352582467072,
+          "pearson_r": 0.11918581626541552
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.044399778092546124,
+      "sensitivity": 0.013315860233787034,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  },
+  {
+    "candidate": "closest_ood",
+    "checkpoint_id": "273ce5c8f782dcdf",
+    "alpha": 0.5,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 811,
+      "mean_B_r": 0.12146452899392358,
+      "cvar_B_r": 0.3783846174456653,
+      "selection_score": 0.31065683771675623,
+      "ordinary_room_death_rate": 0.04315659679408138,
+      "victory_rate": 0.73,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.014796547472256474,
+      "heuristic_same_state_ood_rate": 0.014796547472256474,
+      "ood_excess": 0.0,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.027514905869952918,
+          "observed_mean": 0.028003663003663002,
+          "bias": -0.0004887571337100857,
+          "mae": 0.02621940018828625,
+          "pearson_r": 0.5856293373847562
+        },
+        "B_r": {
+          "predicted_mean": 0.06206816091586539,
+          "observed_mean": 0.12146452899392358,
+          "bias": -0.0593963680780582,
+          "mae": 0.10131770187688693,
+          "pearson_r": 0.14724252407601024
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.0872572125600917,
+      "sensitivity": 0.024264462602635224,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  },
+  {
+    "candidate": "closest_ood",
+    "checkpoint_id": "273ce5c8f782dcdf",
+    "alpha": 0.75,
+    "metrics": {
+      "n_runs": 200,
+      "n_decisions": 821,
+      "mean_B_r": 0.09857215483622069,
+      "cvar_B_r": 0.4941649552564182,
+      "selection_score": 0.3456546324644298,
+      "ordinary_room_death_rate": 0.02679658952496955,
+      "victory_rate": 0.765,
+      "validity": 1.0,
+      "cgan_ood_rate": 0.04506699147381242,
+      "heuristic_same_state_ood_rate": 0.025578562728380026,
+      "ood_excess": 0.019488428745432395,
+      "runtime_guard_rate": 0.0,
+      "fallback_rate": 0.0,
+      "fallback_reasons": {},
+      "q_diagnostics": {
+        "n_runs": 195,
+        "run_death_rate": {
+          "predicted_mean": 0.015887269046267777,
+          "observed_mean": 0.019753764753764756,
+          "bias": -0.003866495707496977,
+          "mae": 0.02432329378219366,
+          "pearson_r": 0.3365803258004098
+        },
+        "B_r": {
+          "predicted_mean": 0.01710112179188125,
+          "observed_mean": 0.09857215483622069,
+          "bias": -0.08147103304433943,
+          "mae": 0.08434780461627292,
+          "pearson_r": 0.14538968429029434
+        }
+      }
+    },
+    "room_level": {
+      "validity": 1.0,
+      "diversity": 0.12567953446081706,
+      "sensitivity": 0.03617465951376491,
+      "note": "Generated continuous hybrid proposals; heuristic reference held fixed for state perturbations."
+    },
+    "ineligible_reasons": []
+  }
+]

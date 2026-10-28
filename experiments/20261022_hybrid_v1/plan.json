@@ -1,0 +1,31 @@
+{
+  "experiment_id": "hybrid_followup_v1",
+  "design": "posthoc exploratory hybrid of two prior validation-selected candidates",
+  "config_version": "exp_v3.2",
+  "git_commit": "175de25424d3a3698312e7d3be0b49fa6069d817",
+  "checkpoint_sha256": {
+    "best_balance": "2ce5d3399c057535da8350961217709c1cb02f30c9fa461b0bcd08bcf8d755ff",
+    "closest_ood": "50cd6e4e810bdca32ccdf8e47e822724c326dc3f324dd531aa727ac14519c781"
+  },
+  "alphas": [
+    0.25,
+    0.5,
+    0.75
+  ],
+  "validation_seeds": [
+    8100000,
+    8100199
+  ],
+  "final_seeds": [
+    9500000,
+    9500399
+  ],
+  "reward_policy": "heuristic",
+  "unchanged_gates": {
+    "max_ordinary_death_rate": 0.08,
+    "max_ood_excess": 0.05,
+    "max_runtime_guard_rate": 0.01,
+    "max_fallback_rate": 0.01
+  },
+  "limitations": "Hybrid differs from original cGAN; new validation subset, original final_test untouched until selection lock."
+}
